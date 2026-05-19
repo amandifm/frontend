@@ -234,16 +234,31 @@ export default function Home() {
     }
   }
 
-  function transactionExportRows(rows = visibleRows) {
-    return rows.map((row) => ({
-      Date: row.date,
-      Description: row.description,
-      Debit: row.debit,
-      Credit: row.credit,
-      Balance: row.balance,
-      Type: row.type,
-      Confidence: row.confidence,
-    }));
+  function cleanCurrencyForSheet(value: string) {
+    if (!value || value === "-") return "";
+
+    const numeric = Number(value.replace(/[$,\s]/g, ""));
+    return Number.isFinite(numeric) ? numeric : value;
+  }
+
+  function downloadWorkbook(workbook: XLSX.WorkBook, fileName: string) {
+    const workbookBuffer = XLSX.write(workbook, {
+      bookType: "xlsx",
+      type: "array",
+      compression: true,
+    });
+    const blob = new Blob([workbookBuffer], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   }
 
   function exportPdf() {
@@ -279,10 +294,29 @@ export default function Home() {
   }
 
   function exportXlsx(rows = visibleRows, sourceName = file?.name || "bank-statement") {
-    const worksheet = XLSX.utils.json_to_sheet(transactionExportRows(rows));
+    const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
+    const worksheetRows = rows.map((row) => [
+      row.date,
+      row.description,
+      cleanCurrencyForSheet(row.debit),
+      cleanCurrencyForSheet(row.credit),
+      cleanCurrencyForSheet(row.balance),
+      row.type,
+      row.confidence,
+    ]);
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...worksheetRows]);
+
+    for (const cellAddress of Object.keys(worksheet)) {
+      if (!/^[C-E]\d+$/.test(cellAddress)) continue;
+      const cell = worksheet[cellAddress];
+      if (cell && typeof cell.v === "number") {
+        cell.z = '$#,##0.00;[Red]-$#,##0.00';
+      }
+    }
+
     worksheet["!cols"] = [
       { wch: 14 },
-      { wch: 36 },
+      { wch: 52 },
       { wch: 14 },
       { wch: 14 },
       { wch: 14 },
@@ -292,7 +326,7 @@ export default function Home() {
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, "Transactions");
     const baseName = sourceName.replace(/\.[^/.]+$/, "").replace(/[^\w-]+/g, "-") || "bank-statement";
-    XLSX.writeFile(workbook, `${baseName}-transactions.xlsx`);
+    downloadWorkbook(workbook, `${baseName}-transactions.xlsx`);
   }
 
   function updateAuthField(field: keyof AuthForm, value: string) {
@@ -916,16 +950,16 @@ export default function Home() {
                   </div>
                 </div>
 
-                <div className="overflow-hidden rounded-lg border border-white/10">
-                  <table className="w-full table-fixed border-collapse text-left">
+                <div className="overflow-x-auto rounded-lg border border-white/10">
+                  <table className="w-full min-w-[820px] border-collapse text-left">
                     <thead className="bg-white/[0.08] text-xs uppercase tracking-[0.16em] text-slate-300">
                       <tr>
-                        <th className="w-[16%] px-3 py-4 font-medium">Date</th>
-                        <th className="w-[30%] px-3 py-4 font-medium">Description</th>
-                        <th className="w-[14%] px-3 py-4 font-medium text-right">Debit</th>
-                        <th className="w-[14%] px-3 py-4 font-medium text-right">Credit</th>
-                        <th className="w-[14%] px-3 py-4 font-medium text-right">Balance</th>
-                        <th className="w-[12%] px-3 py-4 font-medium">Accuracy</th>
+                        <th className="w-[108px] px-3 py-4 font-medium">Date</th>
+                        <th className="min-w-[280px] px-3 py-4 font-medium">Description</th>
+                        <th className="w-[112px] px-3 py-4 font-medium text-right">Debit</th>
+                        <th className="w-[112px] px-3 py-4 font-medium text-right">Credit</th>
+                        <th className="w-[128px] px-3 py-4 font-medium text-right">Balance</th>
+                        <th className="w-[96px] px-3 py-4 font-medium">Accuracy</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/10">
@@ -938,11 +972,19 @@ export default function Home() {
                             transition={{ duration: 0.36 }}
                             className="text-sm text-slate-100"
                           >
-                            <td className="px-3 py-4 font-medium text-white">{row.date}</td>
-                            <td className="px-3 py-4 text-slate-200">{row.description}</td>
-                            <td className="px-3 py-4 text-right text-rose-200">{row.debit}</td>
-                            <td className="px-3 py-4 text-right text-emerald-200">{row.credit}</td>
-                            <td className="px-3 py-4 text-right text-slate-100">{row.balance}</td>
+                            <td className="px-3 py-4 align-top font-medium text-white">{row.date}</td>
+                            <td className="whitespace-normal break-words px-3 py-4 align-top leading-6 text-slate-200">
+                              {row.description}
+                            </td>
+                            <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-rose-200">
+                              {row.debit}
+                            </td>
+                            <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-emerald-200">
+                              {row.credit}
+                            </td>
+                            <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-slate-100">
+                              {row.balance}
+                            </td>
                             <td className="px-3 py-4">
                               <span className="rounded-md bg-cyan-300/10 px-2 py-1 text-cyan-100">
                                 {row.confidence}
@@ -980,32 +1022,38 @@ export default function Home() {
                 </div>
 
                 <div className="mt-5 rounded-lg border border-cyan-200/15 bg-cyan-200/[0.06] p-4 text-sm leading-6 text-slate-300">
-                  <div className="mb-2 flex items-center gap-2 font-medium text-cyan-100">
-                    <FileSpreadsheet className="size-4" />
-                    Export package
-                  </div>
-                  Debit and credit transactions are prepared as PDF and XLSX files once the scan reaches 100%.
-                </div>
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0">
+                      <div className="mb-2 flex items-center gap-2 font-medium text-cyan-100">
+                        <FileSpreadsheet className="size-4 shrink-0" />
+                        Export package
+                      </div>
+                      <p>
+                        Debit and credit transactions are prepared as PDF and XLSX files once the scan reaches 100%.
+                      </p>
+                    </div>
 
-                <div className="absolute bottom-4 right-4 flex gap-2">
-                  <button
-                    type="button"
-                    onClick={exportPdf}
-                    disabled={status !== "complete"}
-                    className="flex items-center gap-2 rounded-lg border border-cyan-200/25 bg-white/[0.08] px-4 py-3 text-sm font-semibold text-cyan-100 transition hover:bg-white/[0.12] disabled:cursor-not-allowed disabled:border-transparent disabled:bg-slate-600 disabled:text-slate-300"
-                  >
-                    <FileText className="size-4" />
-                    PDF
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => exportXlsx()}
-                    disabled={status !== "complete"}
-                    className="flex items-center gap-2 rounded-lg bg-cyan-300 px-4 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 disabled:shadow-none"
-                  >
-                    <ArrowDownToLine className="size-4" />
-                    XLSX
-                  </button>
+                    <div className="flex shrink-0 gap-2">
+                      <button
+                        type="button"
+                        onClick={exportPdf}
+                        disabled={status !== "complete"}
+                        className="flex min-w-24 items-center justify-center gap-2 rounded-lg border border-cyan-200/25 bg-white/[0.08] px-4 py-3 text-sm font-semibold text-cyan-100 transition hover:bg-white/[0.12] disabled:cursor-not-allowed disabled:border-transparent disabled:bg-slate-600 disabled:text-slate-300"
+                      >
+                        <FileText className="size-4" />
+                        PDF
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => exportXlsx()}
+                        disabled={status !== "complete"}
+                        className="flex min-w-24 items-center justify-center gap-2 rounded-lg bg-cyan-300 px-4 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 disabled:shadow-none"
+                      >
+                        <ArrowDownToLine className="size-4" />
+                        XLSX
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </motion.section>
             </motion.div>
