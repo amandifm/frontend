@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <rect width="200" height="200" fill="#f0f0f0"/>
+  <circle cx="100" cy="80" r="40" fill="#3b82f6"/>
+  <rect x="60" y="120" width="80" height="50" fill="#3b82f6" rx="4"/>
+  <text x="100" y="155" font-size="24" font-weight="bold" fill="white" text-anchor="middle" dominant-baseline="middle">DIFM</text>
+  <text x="100" y="25" font-size="14" fill="#1e40af" text-anchor="middle" font-weight="600">Bank Statement</text>
+  <text x="100" y="45" font-size="14" fill="#1e40af" text-anchor="middle" font-weight="600">Extractor</text>
+</svg>
