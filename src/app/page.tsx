@@ -2,6 +2,8 @@
 
 import { AnimatePresence, motion } from "framer-motion";
 import type { Variants } from "framer-motion";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 import {
   ArrowDownToLine,
   BadgeDollarSign,
@@ -22,9 +24,10 @@ import {
   UserCircle,
   UserPlus,
 } from "lucide-react";
-import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import * as XLSX from "xlsx";
 
-type ScanStatus = "idle" | "scanning" | "complete";
+type ScanStatus = "idle" | "scanning" | "complete" | "error";
 
 type ExtractedRow = {
   id: string;
@@ -64,78 +67,16 @@ type HistoryItem = {
   isLocal?: boolean;
 };
 
-const extractedRows: ExtractedRow[] = [
-  {
-    id: "txn-001",
-    date: "02 May 2026",
-    description: "ACH Salary Credit - DIFM Pvt Ltd",
-    debit: "-",
-    credit: "$5,800.00",
-    balance: "$12,430.55",
-    type: "Credit",
-    confidence: "99%",
-  },
-  {
-    id: "txn-002",
-    date: "03 May 2026",
-    description: "Card Purchase - Cloud Workspace",
-    debit: "$64.00",
-    credit: "-",
-    balance: "$12,366.55",
-    type: "Debit",
-    confidence: "98%",
-  },
-  {
-    id: "txn-003",
-    date: "05 May 2026",
-    description: "UPI Transfer - Office Supplies",
-    debit: "$218.40",
-    credit: "-",
-    balance: "$12,148.15",
-    type: "Debit",
-    confidence: "97%",
-  },
-  {
-    id: "txn-004",
-    date: "08 May 2026",
-    description: "Wire Credit - Client Payment",
-    debit: "-",
-    credit: "$2,450.00",
-    balance: "$14,598.15",
-    type: "Credit",
-    confidence: "97%",
-  },
-  {
-    id: "txn-005",
-    date: "11 May 2026",
-    description: "ATM Withdrawal - Downtown Branch",
-    debit: "$300.00",
-    credit: "-",
-    balance: "$14,298.15",
-    type: "Debit",
-    confidence: "96%",
-  },
-  {
-    id: "txn-006",
-    date: "15 May 2026",
-    description: "Bank Fee - Monthly Maintenance",
-    debit: "$14.95",
-    credit: "-",
-    balance: "$14,283.20",
-    type: "Debit",
-    confidence: "95%",
-  },
-  {
-    id: "txn-007",
-    date: "18 May 2026",
-    description: "Interest Credit",
-    debit: "-",
-    credit: "$18.32",
-    balance: "$14,301.52",
-    type: "Credit",
-    confidence: "94%",
-  },
-];
+type ApiTransaction = {
+  id?: string;
+  date?: string;
+  description?: string;
+  debit?: number | string | null;
+  credit?: number | string | null;
+  balance?: number | string | null;
+  type?: "Debit" | "Credit" | string;
+  confidence?: number | string | null;
+};
 
 const panelVariants: Variants = {
   hiddenLeft: { opacity: 0, x: -42, scale: 0.98 },
@@ -148,11 +89,14 @@ const panelVariants: Variants = {
   },
 };
 
-function getSavedUser(): AuthUser | null {
+function getSavedUserSnapshot() {
   if (typeof window === "undefined") return null;
+  return window.localStorage.getItem("difm_user");
+}
 
-  const savedUser = window.localStorage.getItem("difm_user");
-  return savedUser ? JSON.parse(savedUser) : null;
+function subscribeToStorage(callback: () => void) {
+  window.addEventListener("storage", callback);
+  return () => window.removeEventListener("storage", callback);
 }
 
 function formatHistoryConfidence(value: HistoryItem["averageConfidence"]) {
@@ -164,11 +108,46 @@ function formatHistoryConfidence(value: HistoryItem["averageConfidence"]) {
   return `${Math.round(numeric > 1 ? numeric : numeric * 100)}%`;
 }
 
+function formatCurrency(value: ApiTransaction["debit"]) {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "string") return value;
+
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+  }).format(value);
+}
+
+function formatConfidence(value: ApiTransaction["confidence"]) {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "string" && value.includes("%")) return value;
+
+  const numeric = Number(value);
+  if (Number.isNaN(numeric)) return String(value);
+  return `${Math.round(numeric > 1 ? numeric : numeric * 100)}%`;
+}
+
+function mapApiTransaction(row: ApiTransaction, index: number): ExtractedRow {
+  const type = row.type === "Credit" ? "Credit" : "Debit";
+
+  return {
+    id: row.id || `txn-${String(index + 1).padStart(4, "0")}`,
+    date: row.date || "-",
+    description: row.description || "Transaction",
+    debit: formatCurrency(row.debit),
+    credit: formatCurrency(row.credit),
+    balance: formatCurrency(row.balance),
+    type,
+    confidence: formatConfidence(row.confidence),
+  };
+}
+
 export default function Home() {
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [showAuthForm, setShowAuthForm] = useState(false);
-  const [authUser, setAuthUser] = useState<AuthUser | null>(getSavedUser);
+  const storedAuthUserSnapshot = useSyncExternalStore(subscribeToStorage, getSavedUserSnapshot, () => null);
+  const [authOverride, setAuthOverride] = useState<AuthUser | null | undefined>(undefined);
   const [authForm, setAuthForm] = useState<AuthForm>({ name: "", email: "", password: "" });
   const [authError, setAuthError] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
@@ -177,10 +156,21 @@ export default function Home() {
   const [status, setStatus] = useState<ScanStatus>("idle");
   const [progress, setProgress] = useState(0);
   const [visibleRows, setVisibleRows] = useState<ExtractedRow[]>([]);
+  const [extractionError, setExtractionError] = useState("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [savedHistoryKey, setSavedHistoryKey] = useState<string | null>(null);
 
+  const storedAuthUser = useMemo(() => {
+    if (!storedAuthUserSnapshot) return null;
+
+    try {
+      return JSON.parse(storedAuthUserSnapshot) as AuthUser;
+    } catch {
+      return null;
+    }
+  }, [storedAuthUserSnapshot]);
+  const authUser = authOverride === undefined ? storedAuthUser : authOverride;
   const isImage = useMemo(() => file?.type.startsWith("image/") ?? false, [file]);
 
   useEffect(() => {
@@ -193,34 +183,13 @@ export default function Home() {
     if (status !== "scanning") return;
 
     const progressTimer = window.setInterval(() => {
-      setProgress((current) => Math.min(current + 5, 100));
+      setProgress((current) => Math.min(current + 5, 92));
     }, 180);
 
-    const rowTimer = window.setInterval(() => {
-      setVisibleRows((current) => {
-        if (current.length >= extractedRows.length) {
-          window.clearInterval(rowTimer);
-          return current;
-        }
-
-        return extractedRows.slice(0, current.length + 1);
-      });
-    }, 620);
-
-    return () => {
-      window.clearInterval(progressTimer);
-      window.clearInterval(rowTimer);
-    };
+    return () => window.clearInterval(progressTimer);
   }, [status]);
 
-  useEffect(() => {
-    if (progress >= 100 && visibleRows.length === extractedRows.length) {
-      const doneTimer = window.setTimeout(() => setStatus("complete"), 420);
-      return () => window.clearTimeout(doneTimer);
-    }
-  }, [progress, visibleRows.length]);
-
-  function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+  async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const selectedFile = event.target.files?.[0];
     if (!selectedFile) return;
 
@@ -231,13 +200,63 @@ export default function Home() {
     setStatus("scanning");
     setProgress(0);
     setVisibleRows([]);
+    setExtractionError("");
     setSavedHistoryKey(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+
+      const response = await fetch(`${apiBase}/api/uploads/upload`, {
+        method: "POST",
+        body: formData,
+      });
+      const payload = await response.json();
+
+      if (!response.ok || !payload.success) {
+        throw new Error(payload.message || "Unable to extract transactions");
+      }
+
+      const transactions = Array.isArray(payload.data?.transactions)
+        ? payload.data.transactions.map(mapApiTransaction)
+        : [];
+
+      setVisibleRows(transactions);
+      setProgress(100);
+      setStatus("complete");
+    } catch (error) {
+      setVisibleRows([]);
+      setProgress(0);
+      setStatus("error");
+      setExtractionError(error instanceof Error ? error.message : "Unable to extract transactions");
+    } finally {
+      event.target.value = "";
+    }
   }
 
-  function exportDocument() {
-    const csv = [
-      ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"],
-      ...visibleRows.map((row) => [
+  function transactionExportRows(rows = visibleRows) {
+    return rows.map((row) => ({
+      Date: row.date,
+      Description: row.description,
+      Debit: row.debit,
+      Credit: row.credit,
+      Balance: row.balance,
+      Type: row.type,
+      Confidence: row.confidence,
+    }));
+  }
+
+  function exportPdf() {
+    const document = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
+    document.setFontSize(16);
+    document.text("Bank Statement Transactions", 40, 42);
+    document.setFontSize(10);
+    document.text(file?.name || "Extracted statement", 40, 60);
+
+    autoTable(document, {
+      startY: 82,
+      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"]],
+      body: visibleRows.map((row) => [
         row.date,
         row.description,
         row.debit,
@@ -246,17 +265,34 @@ export default function Home() {
         row.type,
         row.confidence,
       ]),
-    ]
-      .map((row) => row.map((cell) => `"${cell.replace(/"/g, '""')}"`).join(","))
-      .join("\n");
+      styles: { fontSize: 8, cellPadding: 5, overflow: "linebreak" },
+      headStyles: { fillColor: [8, 126, 190], textColor: 255 },
+      columnStyles: {
+        1: { cellWidth: 220 },
+        2: { halign: "right" },
+        3: { halign: "right" },
+        4: { halign: "right" },
+      },
+    });
 
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "bank-statement-transactions.csv";
-    link.click();
-    URL.revokeObjectURL(url);
+    document.save("bank-statement-transactions.pdf");
+  }
+
+  function exportXlsx(rows = visibleRows, sourceName = file?.name || "bank-statement") {
+    const worksheet = XLSX.utils.json_to_sheet(transactionExportRows(rows));
+    worksheet["!cols"] = [
+      { wch: 14 },
+      { wch: 36 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 10 },
+      { wch: 12 },
+    ];
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Transactions");
+    const baseName = sourceName.replace(/\.[^/.]+$/, "").replace(/[^\w-]+/g, "-") || "bank-statement";
+    XLSX.writeFile(workbook, `${baseName}-transactions.xlsx`);
   }
 
   function updateAuthField(field: keyof AuthForm, value: string) {
@@ -290,7 +326,7 @@ export default function Home() {
       const user = payload.data.user as AuthUser;
       window.localStorage.setItem("difm_user", JSON.stringify(user));
       window.localStorage.setItem("difm_token", payload.data.token);
-      setAuthUser(user);
+      setAuthOverride(user);
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed");
     } finally {
@@ -307,13 +343,13 @@ export default function Home() {
     };
     window.localStorage.setItem("difm_user", JSON.stringify(guestUser));
     window.localStorage.removeItem("difm_token");
-    setAuthUser(guestUser);
+    setAuthOverride(guestUser);
   }
 
   function logout() {
     window.localStorage.removeItem("difm_user");
     window.localStorage.removeItem("difm_token");
-    setAuthUser(null);
+    setAuthOverride(null);
     setFile(null);
     setVisibleRows([]);
     setProgress(0);
@@ -447,42 +483,44 @@ export default function Home() {
 
         <section
           className={`relative mx-auto grid min-h-screen w-full items-center gap-8 px-5 py-8 transition-[max-width] duration-300 ${
-            showAuthForm ? "max-w-6xl lg:grid-cols-[1fr_430px]" : "max-w-4xl"
+            showAuthForm ? "max-w-md" : "max-w-4xl"
           }`}
         >
-          <div>
-            <div className="mb-7 flex size-14 items-center justify-center rounded-lg border border-cyan-300/30 bg-cyan-300/10 shadow-[0_0_30px_rgba(34,211,238,0.16)]">
-              <ScanLine className="size-7 text-cyan-200" />
+          {!showAuthForm && (
+            <div>
+              <div className="mb-7 flex size-14 items-center justify-center rounded-lg border border-cyan-300/30 bg-cyan-300/10 shadow-[0_0_30px_rgba(34,211,238,0.16)]">
+                <ScanLine className="size-7 text-cyan-200" />
+              </div>
+              <p className="text-sm font-medium uppercase tracking-[0.3em] text-cyan-200/80">
+                DIFM Bank Extractor
+              </p>
+              <h1 className="mt-4 max-w-3xl text-4xl font-semibold tracking-tight sm:text-6xl">
+                Scan bank statements with a secure dashboard.
+              </h1>
+              <p className="mt-5 max-w-2xl text-base leading-7 text-slate-300">
+                Login to save your profile in Database, or continue as a guest to test the
+                statement upload and transaction extraction workflow.
+              </p>
+              <div className="mt-8 grid gap-3 text-sm text-slate-200 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAuthForm(true)}
+                  className="rounded-lg border border-white/10 bg-white/[0.06] p-4 text-left transition hover:border-cyan-200/50 hover:bg-white/[0.1]"
+                >
+                  <LogIn className="mb-3 size-5 text-cyan-200" />
+                  Login / Sign up
+                </button>
+                <button
+                  type="button"
+                  onClick={continueAsGuest}
+                  className="rounded-lg border border-emerald-300/20 bg-emerald-300/10 p-4 text-left text-emerald-100 transition hover:bg-emerald-300/15"
+                >
+                  <UserCircle className="mb-3 size-5" />
+                  Continue as guest
+                </button>
+              </div>
             </div>
-            <p className="text-sm font-medium uppercase tracking-[0.3em] text-cyan-200/80">
-              DIFM Bank Extractor
-            </p>
-            <h1 className="mt-4 max-w-3xl text-4xl font-semibold tracking-tight sm:text-6xl">
-              Scan bank statements with a secure dashboard.
-            </h1>
-            <p className="mt-5 max-w-2xl text-base leading-7 text-slate-300">
-              Login to save your profile in PostgreSQL, or continue as a guest to test the
-              statement upload and transaction extraction workflow.
-            </p>
-            <div className="mt-8 grid gap-3 text-sm text-slate-200 sm:grid-cols-2">
-              <button
-                type="button"
-                onClick={() => setShowAuthForm(true)}
-                className="rounded-lg border border-white/10 bg-white/[0.06] p-4 text-left transition hover:border-cyan-200/50 hover:bg-white/[0.1]"
-              >
-                <LogIn className="mb-3 size-5 text-cyan-200" />
-                Login / Sign up
-              </button>
-              <button
-                type="button"
-                onClick={continueAsGuest}
-                className="rounded-lg border border-emerald-300/20 bg-emerald-300/10 p-4 text-left text-emerald-100 transition hover:bg-emerald-300/15"
-              >
-                <UserCircle className="mb-3 size-5" />
-                Continue as guest
-              </button>
-            </div>
-          </div>
+          )}
 
           <AnimatePresence mode="wait">
             {showAuthForm ? (
@@ -494,6 +532,24 @@ export default function Home() {
                 transition={{ duration: 0.35 }}
                 className="rounded-lg border border-white/10 bg-slate-950/60 p-5 shadow-2xl shadow-black/30 backdrop-blur-xl"
               >
+                <div className="mb-5">
+                  <button
+                    type="button"
+                    onClick={() => setShowAuthForm(false)}
+                    className="text-sm font-medium text-slate-300 transition hover:text-cyan-100"
+                  >
+                    Back
+                  </button>
+                  <div className="mt-5 flex items-center gap-3">
+                    <div className="flex size-11 items-center justify-center rounded-lg border border-cyan-300/30 bg-cyan-300/10">
+                      <ScanLine className="size-5 text-cyan-200" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-cyan-200">DIFM Bank Extractor</p>
+                      <h1 className="text-xl font-semibold text-white">Account access</h1>
+                    </div>
+                  </div>
+                </div>
                 <div className="mb-5 grid grid-cols-2 rounded-lg bg-white/[0.06] p-1">
                   <button
                     type="button"
@@ -636,67 +692,79 @@ export default function Home() {
           </div>
         </div>
 
-        <section className="mt-5 rounded-lg border border-white/10 bg-slate-950/45 p-4 shadow-xl shadow-black/20 backdrop-blur-xl">
-          <div className="mb-4 flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium text-cyan-200">History</p>
-              <h2 className="text-lg font-semibold text-white">Previous bank statement scans</h2>
+        {!authUser.isGuest && (
+          <section className="mt-5 rounded-lg border border-white/10 bg-slate-950/45 p-4 shadow-xl shadow-black/20 backdrop-blur-xl">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium text-cyan-200">History</p>
+                <h2 className="text-lg font-semibold text-white">Previous bank statement scans</h2>
+              </div>
+              <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
+                <Database className="size-4 text-cyan-200" />
+                {history.length} saved
+              </div>
             </div>
-            <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
-              <Database className="size-4 text-cyan-200" />
-              {history.length} saved
-            </div>
-          </div>
 
-          {historyLoading ? (
-            <div className="grid gap-3 md:grid-cols-3">
-              {Array.from({ length: 3 }).map((_, index) => (
-                <div key={index} className="h-24 animate-pulse rounded-lg bg-white/[0.06]" />
-              ))}
-            </div>
-          ) : history.length > 0 ? (
-            <div className="grid gap-3 md:grid-cols-3">
-              {history.map((item) => (
-                <div
-                  key={item.id}
-                  className="rounded-lg border border-white/10 bg-white/[0.05] p-4 transition hover:border-cyan-200/30 hover:bg-white/[0.08]"
-                >
-                  <div className="mb-3 flex items-start justify-between gap-3">
-                    <button
-                      type="button"
-                      onClick={() => restoreHistoryItem(item)}
-                      className="min-w-0 text-left"
-                    >
-                      <p className="truncate text-sm font-semibold text-white">{item.fileName}</p>
-                      <p className="mt-1 flex items-center gap-2 text-xs text-slate-400">
-                        <Clock3 className="size-3" />
-                        {new Date(item.createdAt).toLocaleString()}
-                      </p>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => deleteHistoryItem(item)}
-                      className="flex size-8 shrink-0 items-center justify-center rounded-md border border-rose-300/20 bg-rose-300/10 text-rose-100 transition hover:bg-rose-300/20"
-                      title="Delete history"
-                    >
-                      <Trash2 className="size-4" />
-                    </button>
+            {historyLoading ? (
+              <div className="grid gap-3 md:grid-cols-3">
+                {Array.from({ length: 3 }).map((_, index) => (
+                  <div key={index} className="h-24 animate-pulse rounded-lg bg-white/[0.06]" />
+                ))}
+              </div>
+            ) : history.length > 0 ? (
+              <div className="grid gap-3 md:grid-cols-3">
+                {history.map((item) => (
+                  <div
+                    key={item.id}
+                    className="rounded-lg border border-white/10 bg-white/[0.05] p-4 transition hover:border-cyan-200/30 hover:bg-white/[0.08]"
+                  >
+                    <div className="mb-3 flex items-start justify-between gap-3">
+                      <button
+                        type="button"
+                        onClick={() => restoreHistoryItem(item)}
+                        className="min-w-0 text-left"
+                      >
+                        <p className="truncate text-sm font-semibold text-white">{item.fileName}</p>
+                        <p className="mt-1 flex items-center gap-2 text-xs text-slate-400">
+                          <Clock3 className="size-3" />
+                          {new Date(item.createdAt).toLocaleString()}
+                        </p>
+                      </button>
+                      <div className="flex shrink-0 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => exportXlsx(item.transactions, item.fileName)}
+                          className="flex size-8 items-center justify-center rounded-md border border-cyan-200/20 bg-cyan-300/10 text-cyan-100 transition hover:bg-cyan-300/20"
+                          title="Export history as XLSX"
+                        >
+                          <FileSpreadsheet className="size-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => deleteHistoryItem(item)}
+                          className="flex size-8 items-center justify-center rounded-md border border-rose-300/20 bg-rose-300/10 text-rose-100 transition hover:bg-rose-300/20"
+                          title="Delete history"
+                        >
+                          <Trash2 className="size-4" />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-300">{item.transactionCount} transactions</span>
+                      <span className="rounded-md bg-cyan-300/10 px-2 py-1 text-cyan-100">
+                        {formatHistoryConfidence(item.averageConfidence)}
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-slate-300">{item.transactionCount} transactions</span>
-                    <span className="rounded-md bg-cyan-300/10 px-2 py-1 text-cyan-100">
-                      {formatHistoryConfidence(item.averageConfidence)}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="rounded-lg border border-dashed border-white/15 bg-white/[0.03] px-4 py-6 text-sm text-slate-400">
-              No previous scans yet. Upload a statement and completed scans will appear here.
-            </div>
-          )}
-        </section>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-lg border border-dashed border-white/15 bg-white/[0.03] px-4 py-6 text-sm text-slate-400">
+                No previous scans yet. Upload a statement and completed scans will appear here.
+              </div>
+            )}
+          </section>
+        )}
 
         <AnimatePresence mode="wait">
           {!file ? (
@@ -759,10 +827,12 @@ export default function Home() {
                   <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
                     {status === "complete" ? (
                       <CheckCircle2 className="size-4 text-emerald-300" />
+                    ) : status === "error" ? (
+                      <FileText className="size-4 text-rose-200" />
                     ) : (
                       <Loader2 className="size-4 animate-spin text-cyan-200" />
                     )}
-                    {status === "complete" ? "Complete" : "Scanning"}
+                    {status === "complete" ? "Complete" : status === "error" ? "Failed" : "Scanning"}
                   </div>
                 </div>
 
@@ -820,6 +890,11 @@ export default function Home() {
                       transition={{ duration: 0.22 }}
                     />
                   </div>
+                  {extractionError && (
+                    <p className="mt-3 rounded-lg border border-rose-300/20 bg-rose-300/10 px-4 py-3 text-sm text-rose-100">
+                      {extractionError}
+                    </p>
+                  )}
                 </div>
               </motion.section>
 
@@ -837,7 +912,7 @@ export default function Home() {
                   </div>
                   <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
                     <Sparkles className="size-4 text-amber-200" />
-                    {visibleRows.length}/{extractedRows.length} transactions
+                    {visibleRows.length} transactions
                   </div>
                 </div>
 
@@ -877,8 +952,8 @@ export default function Home() {
                         ))}
                       </AnimatePresence>
 
-                      {visibleRows.length < extractedRows.length &&
-                        Array.from({ length: extractedRows.length - visibleRows.length }).map((_, index) => (
+                      {status === "scanning" &&
+                        Array.from({ length: 6 }).map((_, index) => (
                           <tr key={`skeleton-${index}`} className="bg-white/[0.02]">
                             <td className="px-3 py-4">
                               <div className="h-4 w-20 animate-pulse rounded bg-white/10" />
@@ -909,18 +984,29 @@ export default function Home() {
                     <FileSpreadsheet className="size-4" />
                     Export package
                   </div>
-                  Debit and credit transactions are prepared as a CSV once the scan reaches 100%.
+                  Debit and credit transactions are prepared as PDF and XLSX files once the scan reaches 100%.
                 </div>
 
-                <button
-                  type="button"
-                  onClick={exportDocument}
-                  disabled={status !== "complete"}
-                  className="absolute bottom-4 right-4 flex items-center gap-2 rounded-lg bg-cyan-300 px-5 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 disabled:shadow-none"
-                >
-                  <ArrowDownToLine className="size-4" />
-                  Export transactions
-                </button>
+                <div className="absolute bottom-4 right-4 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={exportPdf}
+                    disabled={status !== "complete"}
+                    className="flex items-center gap-2 rounded-lg border border-cyan-200/25 bg-white/[0.08] px-4 py-3 text-sm font-semibold text-cyan-100 transition hover:bg-white/[0.12] disabled:cursor-not-allowed disabled:border-transparent disabled:bg-slate-600 disabled:text-slate-300"
+                  >
+                    <FileText className="size-4" />
+                    PDF
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => exportXlsx()}
+                    disabled={status !== "complete"}
+                    className="flex items-center gap-2 rounded-lg bg-cyan-300 px-4 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 disabled:shadow-none"
+                  >
+                    <ArrowDownToLine className="size-4" />
+                    XLSX
+                  </button>
+                </div>
               </motion.section>
             </motion.div>
           )}
