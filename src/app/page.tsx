@@ -17,6 +17,8 @@ import {
   LogIn,
   LogOut,
   Loader2,
+  Maximize2,
+  Minimize2,
   ScanLine,
   ShieldCheck,
   Sparkles,
@@ -160,6 +162,7 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [savedHistoryKey, setSavedHistoryKey] = useState<string | null>(null);
+  const [isTableExpanded, setIsTableExpanded] = useState(false);
 
   const storedAuthUser = useMemo(() => {
     if (!storedAuthUserSnapshot) return null;
@@ -202,6 +205,7 @@ export default function Home() {
     setVisibleRows([]);
     setExtractionError("");
     setSavedHistoryKey(null);
+    setIsTableExpanded(false);
 
     try {
       const formData = new FormData();
@@ -390,6 +394,7 @@ export default function Home() {
     setStatus("idle");
     setHistory([]);
     setSavedHistoryKey(null);
+    setIsTableExpanded(false);
   }
 
   function localHistoryKey(user: AuthUser) {
@@ -493,6 +498,7 @@ export default function Home() {
     setVisibleRows(item.transactions);
     setProgress(100);
     setStatus("complete");
+    setIsTableExpanded(false);
   }
 
   useEffect(() => {
@@ -843,32 +849,35 @@ export default function Home() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="grid flex-1 gap-5 py-6 lg:grid-cols-[0.95fr_1.05fr]"
+              className={`grid flex-1 gap-5 py-6 ${
+                isTableExpanded ? "" : "lg:grid-cols-[0.95fr_1.05fr]"
+              }`}
             >
-              <motion.section
-                variants={panelVariants}
-                initial="hiddenLeft"
-                animate="visible"
-                className="relative overflow-hidden rounded-lg border border-white/10 bg-slate-950/55 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
-              >
-                <div className="mb-4 flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-medium text-cyan-200">Bank statement source</p>
-                    <h2 className="max-w-[18rem] truncate text-lg font-semibold text-white sm:max-w-sm">
-                      {file.name}
-                    </h2>
+              {!isTableExpanded && (
+                <motion.section
+                  variants={panelVariants}
+                  initial="hiddenLeft"
+                  animate="visible"
+                  className="relative overflow-hidden rounded-lg border border-white/10 bg-slate-950/55 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
+                >
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium text-cyan-200">Bank statement source</p>
+                      <h2 className="max-w-[18rem] truncate text-lg font-semibold text-white sm:max-w-sm">
+                        {file.name}
+                      </h2>
+                    </div>
+                    <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
+                      {status === "complete" ? (
+                        <CheckCircle2 className="size-4 text-emerald-300" />
+                      ) : status === "error" ? (
+                        <FileText className="size-4 text-rose-200" />
+                      ) : (
+                        <Loader2 className="size-4 animate-spin text-cyan-200" />
+                      )}
+                      {status === "complete" ? "Complete" : status === "error" ? "Failed" : "Scanning"}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
-                    {status === "complete" ? (
-                      <CheckCircle2 className="size-4 text-emerald-300" />
-                    ) : status === "error" ? (
-                      <FileText className="size-4 text-rose-200" />
-                    ) : (
-                      <Loader2 className="size-4 animate-spin text-cyan-200" />
-                    )}
-                    {status === "complete" ? "Complete" : status === "error" ? "Failed" : "Scanning"}
-                  </div>
-                </div>
 
                 <div className="relative min-h-[520px] overflow-hidden rounded-lg border border-white/10 bg-[#0c1220]">
                   {isImage && previewUrl ? (
@@ -930,7 +939,8 @@ export default function Home() {
                     </p>
                   )}
                 </div>
-              </motion.section>
+                </motion.section>
+              )}
 
               <motion.section
                 variants={panelVariants}
@@ -944,9 +954,20 @@ export default function Home() {
                     <p className="text-sm font-medium text-cyan-200">Extracted transactions</p>
                     <h2 className="text-lg font-semibold text-white">Bank statement table</h2>
                   </div>
-                  <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
-                    <Sparkles className="size-4 text-amber-200" />
-                    {visibleRows.length} transactions
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
+                      <Sparkles className="size-4 text-amber-200" />
+                      {visibleRows.length} transactions
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setIsTableExpanded((current) => !current)}
+                      className="flex size-10 items-center justify-center rounded-lg border border-cyan-200/25 bg-cyan-300/10 text-cyan-100 transition hover:border-cyan-100/50 hover:bg-cyan-300/20"
+                      title={isTableExpanded ? "Restore dashboard layout" : "Stretch transaction dashboard"}
+                      aria-label={isTableExpanded ? "Restore dashboard layout" : "Stretch transaction dashboard"}
+                    >
+                      {isTableExpanded ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+                    </button>
                   </div>
                 </div>
 
