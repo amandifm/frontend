@@ -81,6 +81,15 @@ type ApiTransaction = {
   confidence?: number | string | null;
 };
 
+type DocumentMetadata = {
+  account_holder?: string;
+  account_number?: string;
+  bank_name?: string;
+  statement_period_start?: string;
+  statement_period_end?: string;
+  statement_date?: string;
+};
+
 const panelVariants: Variants = {
   hiddenLeft: { opacity: 0, x: -42, scale: 0.98 },
   hiddenRight: { opacity: 0, x: 42, scale: 0.98 },
@@ -145,6 +154,35 @@ function mapApiTransaction(row: ApiTransaction, index: number): ExtractedRow {
   };
 }
 
+function calculateTransactionStats(rows: ExtractedRow[]) {
+  let totalDebit = 0;
+  let totalCredit = 0;
+  let countDebit = 0;
+  let countCredit = 0;
+
+  rows.forEach((row) => {
+    const debitValue = parseFloat(row.debit.replace(/[$,\s]/g, "")) || 0;
+    const creditValue = parseFloat(row.credit.replace(/[$,\s]/g, "")) || 0;
+
+    if (debitValue > 0) {
+      totalDebit += debitValue;
+      countDebit++;
+    }
+    if (creditValue > 0) {
+      totalCredit += creditValue;
+      countCredit++;
+    }
+  });
+
+  return {
+    totalDebit,
+    totalCredit,
+    netAmount: totalCredit - totalDebit,
+    countDebit,
+    countCredit,
+  };
+}
+
 export default function Home() {
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
   const [authMode, setAuthMode] = useState<AuthMode>("login");
@@ -159,6 +197,7 @@ export default function Home() {
   const [status, setStatus] = useState<ScanStatus>("idle");
   const [progress, setProgress] = useState(0);
   const [visibleRows, setVisibleRows] = useState<ExtractedRow[]>([]);
+  const [documentMetadata, setDocumentMetadata] = useState<DocumentMetadata>({});
   const [extractionError, setExtractionError] = useState("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -204,6 +243,7 @@ export default function Home() {
     setStatus("scanning");
     setProgress(0);
     setVisibleRows([]);
+    setDocumentMetadata({});
     setExtractionError("");
     setSavedHistoryKey(null);
     setIsTableExpanded(false);
@@ -227,10 +267,12 @@ export default function Home() {
         : [];
 
       setVisibleRows(transactions);
+      setDocumentMetadata(payload.data?.metadata || {});
       setProgress(100);
       setStatus("complete");
     } catch (error) {
       setVisibleRows([]);
+      setDocumentMetadata({});
       setProgress(0);
       setStatus("error");
       setExtractionError(error instanceof Error ? error.message : "Unable to extract transactions");
@@ -273,8 +315,42 @@ export default function Home() {
     document.setFontSize(10);
     document.text(file?.name || "Extracted statement", 40, 60);
 
+    // Add metadata section
+    let currentY = 82;
+    // if (Object.keys(documentMetadata).length > 0) {
+    //   document.setFontSize(9);
+    //   document.setTextColor(100, 100, 100);
+      
+    //   const metadataLines: string[] = [];
+    //   if (documentMetadata.account_holder) {
+    //     metadataLines.push(`Account Holder: ${documentMetadata.account_holder}`);
+    //   }
+    //   if (documentMetadata.account_number) {
+    //     metadataLines.push(`Account Number: ${documentMetadata.account_number}`);
+    //   }
+    //   if (documentMetadata.bank_name) {
+    //     metadataLines.push(`Bank: ${documentMetadata.bank_name}`);
+    //   }
+    //   if (documentMetadata.statement_period_start || documentMetadata.statement_period_end) {
+    //     const period = [documentMetadata.statement_period_start, documentMetadata.statement_period_end]
+    //       .filter(Boolean)
+    //       .join(" to ");
+    //     metadataLines.push(`Period: ${period}`);
+    //   } else if (documentMetadata.statement_date) {
+    //     metadataLines.push(`Statement Date: ${documentMetadata.statement_date}`);
+    //   }
+      
+    //   metadataLines.forEach((line) => {
+    //     document.text(line, 40, currentY);
+    //     currentY += 12;
+    //   });
+    //   currentY += 8; // Add spacing before table
+    //   document.setTextColor(0, 0, 0);
+    // }
+
     autoTable(document, {
       startY: 82,
+      // startY: currentY,
       head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"]],
       body: visibleRows.map((row) => [
         row.date,
@@ -299,6 +375,26 @@ export default function Home() {
   }
 
   function exportXlsx(rows = visibleRows, sourceName = file?.name || "bank-statement") {
+    const workbook = XLSX.utils.book_new();
+
+    // Create metadata sheet if we have any metadata
+    // if (Object.keys(documentMetadata).length > 0) {
+    //   const metadataSheetData: (string | undefined)[][] = [
+    //     ["Field", "Value"],
+    //     ["File Name", file?.name],
+    //     ...(documentMetadata.account_holder ? [["Account Holder", documentMetadata.account_holder]] : []),
+    //     ...(documentMetadata.account_number ? [["Account Number", documentMetadata.account_number]] : []),
+    //     ...(documentMetadata.bank_name ? [["Bank Name", documentMetadata.bank_name]] : []),
+    //     ...(documentMetadata.statement_period_start ? [["Statement Period Start", documentMetadata.statement_period_start]] : []),
+    //     ...(documentMetadata.statement_period_end ? [["Statement Period End", documentMetadata.statement_period_end]] : []),
+    //     ...(documentMetadata.statement_date ? [["Statement Date", documentMetadata.statement_date]] : []),
+    //   ];
+    //   const metadataWorksheet = XLSX.utils.aoa_to_sheet(metadataSheetData);
+    //   metadataWorksheet["!cols"] = [{ wch: 25 }, { wch: 40 }];
+    //   XLSX.utils.book_append_sheet(workbook, metadataWorksheet, "Document Info");
+    // }
+
+    // Create transactions sheet
     const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
     const worksheetRows = rows.map((row) => [
       row.date,
@@ -328,7 +424,6 @@ export default function Home() {
       { wch: 10 },
       { wch: 12 },
     ];
-    const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, "Transactions");
     const baseName = sourceName.replace(/\.[^/.]+$/, "").replace(/[^\w-]+/g, "-") || "bank-statement";
     downloadWorkbook(workbook, `${baseName}-transactions.xlsx`);
@@ -865,234 +960,342 @@ export default function Home() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className={`grid flex-1 gap-5 py-6 ${
-                isTableExpanded ? "" : "lg:grid-cols-[0.95fr_1.05fr]"
-              }`}
+              className="flex flex-1 flex-col gap-5 py-6"
             >
-              {!isTableExpanded && (
-                <motion.section
-                  variants={panelVariants}
-                  initial="hiddenLeft"
-                  animate="visible"
-                  className="relative overflow-hidden rounded-lg border border-white/10 bg-slate-950/55 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
-                >
-                  <div className="mb-4 flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-medium text-cyan-200">Bank statement source</p>
-                      <h2 className="max-w-[18rem] truncate text-lg font-semibold text-white sm:max-w-sm">
-                        {file.name}
-                      </h2>
-                    </div>
-                    <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
-                      {status === "complete" ? (
-                        <CheckCircle2 className="size-4 text-emerald-300" />
-                      ) : status === "error" ? (
-                        <FileText className="size-4 text-rose-200" />
-                      ) : (
-                        <Loader2 className="size-4 animate-spin text-cyan-200" />
-                      )}
-                      {status === "complete" ? "Complete" : status === "error" ? "Failed" : "Scanning"}
-                    </div>
-                  </div>
-
-                <div className="relative min-h-[520px] overflow-hidden rounded-lg border border-white/10 bg-[#0c1220]">
-                  {isImage && previewUrl ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      src={previewUrl}
-                      alt="Uploaded document preview"
-                      className="h-full min-h-[520px] w-full object-contain"
-                    />
-                  ) : (
-                    <div className="grid min-h-[520px] place-items-center p-8">
-                      <div className="w-full max-w-md rounded-lg border border-white/10 bg-white/[0.06] p-7 shadow-xl">
-                        <FileText className="mb-6 size-14 text-cyan-200" />
-                        <div className="space-y-3">
-                          <div className="h-4 w-3/5 rounded bg-white/20" />
-                          <div className="h-4 w-4/5 rounded bg-white/14" />
-                          <div className="mt-7 grid grid-cols-4 gap-2">
-                            <div className="h-8 rounded bg-cyan-200/20" />
-                            <div className="h-8 rounded bg-cyan-200/20" />
-                            <div className="h-8 rounded bg-cyan-200/20" />
-                            <div className="h-8 rounded bg-cyan-200/20" />
-                          </div>
-                          {Array.from({ length: 8 }).map((_, index) => (
-                            <div key={index} className="grid grid-cols-4 gap-2">
-                              <div className="h-5 rounded bg-white/10" />
-                              <div className="h-5 rounded bg-white/10" />
-                              <div className="h-5 rounded bg-white/10" />
-                              <div className="h-5 rounded bg-white/10" />
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {status === "scanning" && (
-                    <div className="pointer-events-none absolute inset-0 overflow-hidden bg-cyan-300/5">
-                      <div className="scan-beam absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-transparent via-cyan-200/55 to-transparent shadow-[0_0_55px_rgba(103,232,249,0.75)]" />
-                      <div className="scan-grid absolute inset-0" />
-                    </div>
-                  )}
-                </div>
-
-                <div className="mt-4">
-                  <div className="mb-2 flex justify-between text-sm text-slate-300">
-                    <span>Transaction extraction progress</span>
-                    <span>{progress}%</span>
-                  </div>
-                  <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                    <motion.div
-                      className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-emerald-300 to-amber-200"
-                      animate={{ width: `${progress}%` }}
-                      transition={{ duration: 0.22 }}
-                    />
-                  </div>
-                  {extractionError && (
-                    <p className="mt-3 rounded-lg border border-rose-300/20 bg-rose-300/10 px-4 py-3 text-sm text-rose-100">
-                      {extractionError}
-                    </p>
-                  )}
-                </div>
-                </motion.section>
-              )}
-
-              <motion.section
+              {/* Top Stats Section - Spans Full Width */}
+              <motion.div
                 variants={panelVariants}
                 initial="hiddenRight"
                 animate="visible"
-                transition={{ delay: 0.08 }}
-                className="relative overflow-hidden rounded-lg border border-white/10 bg-slate-950/55 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
+                transition={{ delay: 0.02 }}
+                className="rounded-lg border border-white/10 bg-gradient-to-r from-cyan-500/10 via-emerald-500/10 to-blue-500/10 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
               >
-                <div className="mb-5 flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-medium text-cyan-200">Extracted transactions</p>
-                    <h2 className="text-lg font-semibold text-white">Bank statement table</h2>
+                <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-4">
+                  {/* File Name Card */}
+                  <div className="rounded-lg border border-cyan-300/30 bg-gradient-to-br from-cyan-500/15 to-cyan-600/5 p-3">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-cyan-200">File Name</p>
+                    <p className="mt-2 truncate text-sm font-bold text-white">{file?.name || "Document"}</p>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
-                      <Sparkles className="size-4 text-amber-200" />
-                      {visibleRows.length} transactions
+
+                  {/* Total Transactions Card */}
+                  <div className="rounded-lg border border-emerald-300/30 bg-gradient-to-br from-emerald-500/15 to-emerald-600/5 p-3">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-emerald-200">Total Transactions</p>
+                    <p className="mt-2 text-2xl font-bold text-emerald-100">{visibleRows.length}</p>
+                  </div>
+
+                  {/* Total Debit Card */}
+                  {(() => {
+                    const stats = calculateTransactionStats(visibleRows);
+                    return (
+                      <>
+                        <div className="rounded-lg border border-rose-300/30 bg-gradient-to-br from-rose-500/15 to-rose-600/5 p-3">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-rose-200">Total Debit</p>
+                          <p className="mt-2 text-sm font-bold text-rose-100">
+                            $
+                            {stats.totalDebit.toLocaleString("en-US", {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            })}
+                          </p>
+                          <p className="mt-1 text-xs text-rose-300">{stats.countDebit} transactions</p>
+                        </div>
+
+                        {/* Total Credit Card */}
+                        <div className="rounded-lg border border-emerald-300/30 bg-gradient-to-br from-emerald-500/15 to-emerald-600/5 p-3">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-emerald-200">Total Credit</p>
+                          <p className="mt-2 text-sm font-bold text-emerald-100">
+                            $
+                            {stats.totalCredit.toLocaleString("en-US", {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            })}
+                          </p>
+                          <p className="mt-1 text-xs text-emerald-300">{stats.countCredit} transactions</p>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+
+                {/* Document Info Row */}
+                {Object.keys(documentMetadata).length > 0 && (
+                  <div className="grid grid-cols-1 gap-2 rounded-lg bg-white/[0.04] p-3 text-xs text-slate-300">
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      {documentMetadata.account_holder && (
+                        <div>
+                          <span className="font-semibold text-cyan-200">Account Holder:</span>
+                          <p className="text-slate-100">{documentMetadata.account_holder}</p>
+                        </div>
+                      )}
+                      {documentMetadata.account_number && (
+                        <div>
+                          <span className="font-semibold text-cyan-200">Account Number:</span>
+                          <p className="text-slate-100">{documentMetadata.account_number}</p>
+                        </div>
+                      )}
+                      {documentMetadata.bank_name && (
+                        <div>
+                          <span className="font-semibold text-cyan-200">Bank:</span>
+                          <p className="text-slate-100">{documentMetadata.bank_name}</p>
+                        </div>
+                      )}
+                      {(documentMetadata.statement_period_start || documentMetadata.statement_period_end) && (
+                        <div>
+                          <span className="font-semibold text-cyan-200">Period:</span>
+                          <p className="text-slate-100">
+                            {[documentMetadata.statement_period_start, documentMetadata.statement_period_end]
+                              .filter(Boolean)
+                              .join(" to ")}
+                          </p>
+                        </div>
+                      )}
+                      {documentMetadata.statement_date && (
+                        <div>
+                          <span className="font-semibold text-cyan-200">Statement Date:</span>
+                          <p className="text-slate-100">{documentMetadata.statement_date}</p>
+                        </div>
+                      )}
                     </div>
+                  </div>
+                )}
+              </motion.div>
+
+              {/* Content Grid - Document Preview + Transactions */}
+              <div className={`grid flex-1 gap-5 ${
+                isTableExpanded ? "" : "lg:grid-cols-[0.95fr_1.05fr]"
+              }`}>
+                {!isTableExpanded && (
+                  <motion.section
+                    variants={panelVariants}
+                    initial="hiddenLeft"
+                    animate="visible"
+                    className="relative overflow-hidden rounded-lg border border-white/10 bg-slate-950/55 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
+                  >
+                    <div className="mb-4 flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium text-cyan-200">Bank statement source</p>
+                        <h2 className="max-w-[18rem] truncate text-lg font-semibold text-white sm:max-w-sm">
+                          {file.name}
+                        </h2>
+                      </div>
+                      <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
+                        {status === "complete" ? (
+                          <CheckCircle2 className="size-4 text-emerald-300" />
+                        ) : status === "error" ? (
+                          <FileText className="size-4 text-rose-200" />
+                        ) : (
+                          <Loader2 className="size-4 animate-spin text-cyan-200" />
+                        )}
+                        {status === "complete" ? "Complete" : status === "error" ? "Failed" : "Scanning"}
+                      </div>
+                    </div>
+
+                  <div className="relative min-h-[520px] overflow-hidden rounded-lg border border-white/10 bg-[#0c1220]">
+                    {isImage && previewUrl ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={previewUrl}
+                        alt="Uploaded document preview"
+                        className="h-full min-h-[520px] w-full object-contain"
+                      />
+                    ) : (
+                      <div className="grid min-h-[520px] place-items-center p-8">
+                        <div className="w-full max-w-md rounded-lg border border-white/10 bg-white/[0.06] p-7 shadow-xl">
+                          <FileText className="mb-6 size-14 text-cyan-200" />
+                          <div className="space-y-3">
+                            <div className="h-4 w-3/5 rounded bg-white/20" />
+                            <div className="h-4 w-4/5 rounded bg-white/14" />
+                            <div className="mt-7 grid grid-cols-4 gap-2">
+                              <div className="h-8 rounded bg-cyan-200/20" />
+                              <div className="h-8 rounded bg-cyan-200/20" />
+                              <div className="h-8 rounded bg-cyan-200/20" />
+                              <div className="h-8 rounded bg-cyan-200/20" />
+                            </div>
+                            {Array.from({ length: 8 }).map((_, index) => (
+                              <div key={index} className="grid grid-cols-4 gap-2">
+                                <div className="h-5 rounded bg-white/10" />
+                                <div className="h-5 rounded bg-white/10" />
+                                <div className="h-5 rounded bg-white/10" />
+                                <div className="h-5 rounded bg-white/10" />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {status === "scanning" && (
+                      <div className="pointer-events-none absolute inset-0 overflow-hidden bg-cyan-300/5">
+                        <div className="scan-beam absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-transparent via-cyan-200/55 to-transparent shadow-[0_0_55px_rgba(103,232,249,0.75)]" />
+                        <div className="scan-grid absolute inset-0" />
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-4">
+                    <div className="mb-2 flex justify-between text-sm text-slate-300">
+                      <span>Transaction extraction progress</span>
+                      <span>{progress}%</span>
+                    </div>
+                    <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                      <motion.div
+                        className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-emerald-300 to-amber-200"
+                        animate={{ width: `${progress}%` }}
+                        transition={{ duration: 0.22 }}
+                      />
+                    </div>
+                    {extractionError && (
+                      <p className="mt-3 rounded-lg border border-rose-300/20 bg-rose-300/10 px-4 py-3 text-sm text-rose-100">
+                        {extractionError}
+                      </p>
+                    )}
+                  </div>
+                  </motion.section>
+                )}
+
+                <motion.section
+                  variants={panelVariants}
+                  initial="hiddenRight"
+                  animate="visible"
+                  transition={{ delay: 0.08 }}
+                  className="relative flex flex-col overflow-hidden rounded-lg border border-white/10 bg-slate-950/55 shadow-2xl shadow-black/30 backdrop-blur-xl"
+                >
+                  {/* Transactions Table Section */}
+                  <div className="flex flex-col p-4">
+                    <div className="mb-4 flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium text-cyan-200">Extracted transactions</p>
+                        <h2 className="text-base font-semibold text-white sm:text-lg">Bank statement table</h2>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setIsTableExpanded((current) => !current)}
+                        className="flex size-10 items-center justify-center rounded-lg border border-cyan-200/25 bg-cyan-300/10 text-cyan-100 transition hover:border-cyan-100/50 hover:bg-cyan-300/20"
+                        title={isTableExpanded ? "Restore dashboard layout" : "Stretch transaction dashboard"}
+                        aria-label={isTableExpanded ? "Restore dashboard layout" : "Stretch transaction dashboard"}
+                      >
+                        {isTableExpanded ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+                      </button>
+                    </div>
+
+                    {/* Scrollable Table Container */}
+                    <div className="overflow-x-auto overflow-y-auto rounded-lg border border-white/10" style={{ maxHeight: '730px' }}>
+                      <table className="w-full min-w-[600px] border-collapse text-left">
+                        <thead className="sticky top-0 z-10 bg-white/[0.1] text-xs uppercase tracking-[0.16em] text-slate-300">
+                          <tr>
+                            <th className="w-[100px] px-3 py-4 font-medium">Date</th>
+                            <th className="w-[100px] px-3 py-4 font-medium">Description</th>
+                            <th className="w-[100px] px-3 py-4 font-medium text-right">Debit</th>
+                            <th className="w-[100px] px-3 py-4 font-medium text-right">Credit</th>
+                            <th className="w-[110px] px-3 py-4 font-medium text-right">Balance</th>
+                            <th className="w-[80px] px-3 py-4 font-medium">Accuracy</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/10">
+                          <AnimatePresence initial={false}>
+                            {visibleRows.map((row) => (
+                              <motion.tr
+                                key={row.id}
+                                initial={{ opacity: 0, y: 14, backgroundColor: "rgba(103,232,249,0.18)" }}
+                                animate={{ opacity: 1, y: 0, backgroundColor: "rgba(255,255,255,0.03)" }}
+                                transition={{ duration: 0.36 }}
+                                className="text-sm text-slate-100"
+                              >
+                                <td className="px-3 py-4 align-top font-medium text-white">{row.date}</td>
+                                <td className="w-[100px] overflow-hidden text-ellipsis px-3 py-4 align-top leading-5 text-slate-200" title={row.description}>
+                                  <div className="line-clamp-2 break-words">
+                                    {row.description}
+                                  </div>
+                                </td>
+                                <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-rose-200">
+                                  {row.debit}
+                                </td>
+                                <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-emerald-200">
+                                  {row.credit}
+                                </td>
+                                <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-slate-100">
+                                  {row.balance}
+                                </td>
+                                <td className="px-3 py-4">
+                                  <span className="rounded-md bg-cyan-300/10 px-2 py-1 text-xs text-cyan-100">
+                                    {row.confidence}
+                                  </span>
+                                </td>
+                              </motion.tr>
+                            ))}
+                          </AnimatePresence>
+
+                          {status === "scanning" &&
+                            Array.from({ length: 6 }).map((_, index) => (
+                              <tr key={`skeleton-${index}`} className="bg-white/[0.02]">
+                                <td className="px-3 py-4">
+                                  <div className="h-4 w-16 animate-pulse rounded bg-white/10" />
+                                </td>
+                                <td className="px-3 py-4">
+                                  <div className="h-4 w-32 animate-pulse rounded bg-white/10" />
+                                </td>
+                                <td className="px-3 py-4">
+                                  <div className="ml-auto h-4 w-14 animate-pulse rounded bg-white/10" />
+                                </td>
+                                <td className="px-3 py-4">
+                                  <div className="ml-auto h-4 w-14 animate-pulse rounded bg-white/10" />
+                                </td>
+                                <td className="px-3 py-4">
+                                  <div className="ml-auto h-4 w-14 animate-pulse rounded bg-white/10" />
+                                </td>
+                                <td className="px-3 py-4">
+                                  <div className="h-6 w-10 animate-pulse rounded-md bg-white/10" />
+                                </td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </motion.section>
+              </div>
+
+              {/* Export Section */}
+              <motion.div
+                variants={panelVariants}
+                initial="hiddenRight"
+                animate="visible"
+                transition={{ delay: 0.12 }}
+                className="rounded-lg border border-white/10 bg-gradient-to-r from-cyan-300/[0.04] to-emerald-300/[0.04] p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
+              >
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="mb-2 flex items-center gap-2 font-medium text-cyan-100">
+                      <FileSpreadsheet className="size-4 shrink-0" />
+                      Export package
+                    </div>
+                    <p className="text-sm leading-6 text-slate-300">
+                      Debit and credit transactions with document details are prepared as PDF and XLSX files once the scan reaches 100%.
+                    </p>
+                  </div>
+
+                  <div className="flex shrink-0 gap-2">
                     <button
                       type="button"
-                      onClick={() => setIsTableExpanded((current) => !current)}
-                      className="flex size-10 items-center justify-center rounded-lg border border-cyan-200/25 bg-cyan-300/10 text-cyan-100 transition hover:border-cyan-100/50 hover:bg-cyan-300/20"
-                      title={isTableExpanded ? "Restore dashboard layout" : "Stretch transaction dashboard"}
-                      aria-label={isTableExpanded ? "Restore dashboard layout" : "Stretch transaction dashboard"}
+                      onClick={exportPdf}
+                      disabled={status !== "complete"}
+                      className="flex min-w-24 items-center justify-center gap-2 rounded-lg border border-cyan-200/25 bg-white/[0.08] px-4 py-3 text-sm font-semibold text-cyan-100 transition hover:bg-white/[0.12] disabled:cursor-not-allowed disabled:border-transparent disabled:bg-slate-600 disabled:text-slate-300"
                     >
-                      {isTableExpanded ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+                      <FileText className="size-4" />
+                      PDF
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => exportXlsx()}
+                      disabled={status !== "complete"}
+                      className="flex min-w-24 items-center justify-center gap-2 rounded-lg bg-cyan-300 px-4 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 disabled:shadow-none"
+                    >
+                      <ArrowDownToLine className="size-4" />
+                      XLSX
                     </button>
                   </div>
                 </div>
-
-                <div className="overflow-x-auto rounded-lg border border-white/10">
-                  <table className="w-full min-w-[820px] border-collapse text-left">
-                    <thead className="bg-white/[0.08] text-xs uppercase tracking-[0.16em] text-slate-300">
-                      <tr>
-                        <th className="w-[108px] px-3 py-4 font-medium">Date</th>
-                        <th className="min-w-[280px] px-3 py-4 font-medium">Description</th>
-                        <th className="w-[112px] px-3 py-4 font-medium text-right">Debit</th>
-                        <th className="w-[112px] px-3 py-4 font-medium text-right">Credit</th>
-                        <th className="w-[128px] px-3 py-4 font-medium text-right">Balance</th>
-                        <th className="w-[96px] px-3 py-4 font-medium">Accuracy</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-white/10">
-                      <AnimatePresence initial={false}>
-                        {visibleRows.map((row) => (
-                          <motion.tr
-                            key={row.id}
-                            initial={{ opacity: 0, y: 14, backgroundColor: "rgba(103,232,249,0.18)" }}
-                            animate={{ opacity: 1, y: 0, backgroundColor: "rgba(255,255,255,0.03)" }}
-                            transition={{ duration: 0.36 }}
-                            className="text-sm text-slate-100"
-                          >
-                            <td className="px-3 py-4 align-top font-medium text-white">{row.date}</td>
-                            <td className="whitespace-normal break-words px-3 py-4 align-top leading-6 text-slate-200">
-                              {row.description}
-                            </td>
-                            <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-rose-200">
-                              {row.debit}
-                            </td>
-                            <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-emerald-200">
-                              {row.credit}
-                            </td>
-                            <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-slate-100">
-                              {row.balance}
-                            </td>
-                            <td className="px-3 py-4">
-                              <span className="rounded-md bg-cyan-300/10 px-2 py-1 text-cyan-100">
-                                {row.confidence}
-                              </span>
-                            </td>
-                          </motion.tr>
-                        ))}
-                      </AnimatePresence>
-
-                      {status === "scanning" &&
-                        Array.from({ length: 6 }).map((_, index) => (
-                          <tr key={`skeleton-${index}`} className="bg-white/[0.02]">
-                            <td className="px-3 py-4">
-                              <div className="h-4 w-20 animate-pulse rounded bg-white/10" />
-                            </td>
-                            <td className="px-3 py-4">
-                              <div className="h-4 w-36 animate-pulse rounded bg-white/10" />
-                            </td>
-                            <td className="px-3 py-4">
-                              <div className="ml-auto h-4 w-16 animate-pulse rounded bg-white/10" />
-                            </td>
-                            <td className="px-3 py-4">
-                              <div className="ml-auto h-4 w-16 animate-pulse rounded bg-white/10" />
-                            </td>
-                            <td className="px-3 py-4">
-                              <div className="ml-auto h-4 w-16 animate-pulse rounded bg-white/10" />
-                            </td>
-                            <td className="px-3 py-4">
-                              <div className="h-6 w-12 animate-pulse rounded-md bg-white/10" />
-                            </td>
-                          </tr>
-                        ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="mt-5 rounded-lg border border-cyan-200/15 bg-cyan-200/[0.06] p-4 text-sm leading-6 text-slate-300">
-                  <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="min-w-0">
-                      <div className="mb-2 flex items-center gap-2 font-medium text-cyan-100">
-                        <FileSpreadsheet className="size-4 shrink-0" />
-                        Export package
-                      </div>
-                      <p>
-                        Debit and credit transactions are prepared as PDF and XLSX files once the scan reaches 100%.
-                      </p>
-                    </div>
-
-                    <div className="flex shrink-0 gap-2">
-                      <button
-                        type="button"
-                        onClick={exportPdf}
-                        disabled={status !== "complete"}
-                        className="flex min-w-24 items-center justify-center gap-2 rounded-lg border border-cyan-200/25 bg-white/[0.08] px-4 py-3 text-sm font-semibold text-cyan-100 transition hover:bg-white/[0.12] disabled:cursor-not-allowed disabled:border-transparent disabled:bg-slate-600 disabled:text-slate-300"
-                      >
-                        <FileText className="size-4" />
-                        PDF
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => exportXlsx()}
-                        disabled={status !== "complete"}
-                        className="flex min-w-24 items-center justify-center gap-2 rounded-lg bg-cyan-300 px-4 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 disabled:shadow-none"
-                      >
-                        <ArrowDownToLine className="size-4" />
-                        XLSX
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </motion.section>
+              </motion.div>
             </motion.div>
           )}
         </AnimatePresence>
