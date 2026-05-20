@@ -26,6 +26,7 @@ import {
   UserCircle,
   UserPlus,
 } from "lucide-react";
+import Link from "next/link";
 import { ChangeEvent, FormEvent, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import * as XLSX from "xlsx";
 
@@ -668,6 +669,21 @@ export default function Home() {
                     )}
                     {authMode === "login" ? "Login" : "Create account"}
                   </button>
+                  
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+                    <span className="text-xs uppercase tracking-wider text-slate-400">or</span>
+                    <div className="flex-1 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+                  </div>
+                  
+                  <Link 
+                    href="/" 
+                    onClick={continueAsGuest}
+                    className="flex h-12 w-full items-center justify-center gap-2 rounded-lg border border-emerald-300/30 bg-emerald-300/10 px-5 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300/50 hover:bg-emerald-300/20 active:bg-emerald-300/15"
+                  >
+                    <UserCircle className="size-4" />
+                    Continue as guest
+                  </Link>
                 </form>
               </motion.div>
             ) : null}
