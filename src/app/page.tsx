@@ -313,125 +313,268 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
-  function exportPdf() {
-    const document = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
-    document.setFontSize(16);
-    document.text("Bank Statement Transactions", 40, 42);
-    document.setFontSize(10);
-    document.text(file?.name || "Extracted statement", 40, 60);
+function exportPdf() {
+  const document = new jsPDF({
+    orientation: "landscape",
+    unit: "pt",
+    format: "a4",
+  });
 
-    // Add metadata section
-    // if (Object.keys(documentMetadata).length > 0) {
-    //   document.setFontSize(9);
-    //   document.setTextColor(100, 100, 100);
-      
-    //   const metadataLines: string[] = [];
-    //   if (documentMetadata.account_holder) {
-    //     metadataLines.push(`Account Holder: ${documentMetadata.account_holder}`);
-    //   }
-    //   if (documentMetadata.account_number) {
-    //     metadataLines.push(`Account Number: ${documentMetadata.account_number}`);
-    //   }
-    //   if (documentMetadata.bank_name) {
-    //     metadataLines.push(`Bank: ${documentMetadata.bank_name}`);
-    //   }
-    //   if (documentMetadata.statement_period_start || documentMetadata.statement_period_end) {
-    //     const period = [documentMetadata.statement_period_start, documentMetadata.statement_period_end]
-    //       .filter(Boolean)
-    //       .join(" to ");
-    //     metadataLines.push(`Period: ${period}`);
-    //   } else if (documentMetadata.statement_date) {
-    //     metadataLines.push(`Statement Date: ${documentMetadata.statement_date}`);
-    //   }
-      
-    //   metadataLines.forEach((line) => {
-    //     document.text(line, 40, currentY);
-    //     currentY += 12;
-    //   });
-    //   currentY += 8; // Add spacing before table
-    //   document.setTextColor(0, 0, 0);
-    // }
+  let currentY = 42;
 
-    autoTable(document, {
-      startY: 82,
-      // startY: currentY,
-      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"]],
-      body: visibleRows.map((row) => [
-        row.date,
-        row.description,
-        row.debit,
-        row.credit,
-        row.balance,
-        row.type,
-        row.confidence,
-      ]),
-      styles: { fontSize: 8, cellPadding: 5, overflow: "linebreak" },
-      headStyles: { fillColor: [8, 126, 190], textColor: 255 },
-      columnStyles: {
-        1: { cellWidth: 220 },
-        2: { halign: "right" },
-        3: { halign: "right" },
-        4: { halign: "right" },
-      },
+  // Title
+  document.setFontSize(18);
+  document.setTextColor(8, 126, 190);
+  document.text("Bank Statement Extraction Report", 40, currentY);
+
+  currentY += 24;
+
+  document.setFontSize(10);
+  document.setTextColor(90);
+
+  document.text(`File: ${file?.name || "Statement"}`, 40, currentY);
+
+  currentY += 20;
+
+  // =====================
+  // DOCUMENT DETAILS
+  // =====================
+
+  if (Object.keys(documentMetadata).length > 0) {
+    document.setFillColor(245, 248, 250);
+    document.roundedRect(35, currentY - 10, 760, 90, 5, 5, "F");
+
+    document.setFontSize(11);
+    document.setTextColor(0);
+
+    const details = [
+      ["Account Holder", documentMetadata.account_holder],
+      ["Account Number", documentMetadata.account_number],
+      ["Bank Name", documentMetadata.bank_name],
+      [
+        "Statement Period",
+        [
+          documentMetadata.statement_period_start,
+          documentMetadata.statement_period_end,
+        ]
+          .filter(Boolean)
+          .join(" → "),
+      ],
+      ["Statement Date", documentMetadata.statement_date],
+    ];
+
+    let y = currentY + 10;
+
+    details.forEach(([label, value]) => {
+      if (!value) return;
+
+      document.setFont( "bold");
+      document.text(`${label}:`, 50, y);
+
+      document.setFont("normal");
+      document.text(String(value), 180, y);
+
+      y += 16;
     });
 
-    document.save("bank-statement-transactions.pdf");
+    currentY = y + 10;
   }
 
-  function exportXlsx(rows = visibleRows, sourceName = file?.name || "bank-statement") {
-    const workbook = XLSX.utils.book_new();
+  // =====================
+  // SUMMARY
+  // =====================
 
-    // Create metadata sheet if we have any metadata
-    // if (Object.keys(documentMetadata).length > 0) {
-    //   const metadataSheetData: (string | undefined)[][] = [
-    //     ["Field", "Value"],
-    //     ["File Name", file?.name],
-    //     ...(documentMetadata.account_holder ? [["Account Holder", documentMetadata.account_holder]] : []),
-    //     ...(documentMetadata.account_number ? [["Account Number", documentMetadata.account_number]] : []),
-    //     ...(documentMetadata.bank_name ? [["Bank Name", documentMetadata.bank_name]] : []),
-    //     ...(documentMetadata.statement_period_start ? [["Statement Period Start", documentMetadata.statement_period_start]] : []),
-    //     ...(documentMetadata.statement_period_end ? [["Statement Period End", documentMetadata.statement_period_end]] : []),
-    //     ...(documentMetadata.statement_date ? [["Statement Date", documentMetadata.statement_date]] : []),
-    //   ];
-    //   const metadataWorksheet = XLSX.utils.aoa_to_sheet(metadataSheetData);
-    //   metadataWorksheet["!cols"] = [{ wch: 25 }, { wch: 40 }];
-    //   XLSX.utils.book_append_sheet(workbook, metadataWorksheet, "Document Info");
-    // }
+  const stats = calculateTransactionStats(visibleRows);
 
-    // Create transactions sheet
-    const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
-    const worksheetRows = rows.map((row) => [
+  document.setFontSize(11);
+
+  document.text(
+    `Transactions: ${visibleRows.length}`,
+    40,
+    currentY
+  );
+
+  document.text(
+    `Debit: $${stats.totalDebit.toFixed(2)}`,
+    230,
+    currentY
+  );
+
+  document.text(
+    `Credit: $${stats.totalCredit.toFixed(2)}`,
+    420,
+    currentY
+  );
+
+  currentY += 25;
+
+  // =====================
+  // TABLE
+  // =====================
+
+  autoTable(document, {
+    startY: currentY,
+
+    head: [[
+      "Date",
+      "Description",
+      "Debit",
+      "Credit",
+      "Balance",
+      "Type",
+      "Confidence",
+    ]],
+
+    body: visibleRows.map((row) => [
       row.date,
       row.description,
-      cleanCurrencyForSheet(row.debit),
-      cleanCurrencyForSheet(row.credit),
-      cleanCurrencyForSheet(row.balance),
+      row.debit,
+      row.credit,
+      row.balance,
       row.type,
       row.confidence,
+    ]),
+
+    styles: {
+      fontSize: 8,
+      cellPadding: 5,
+      overflow: "linebreak",
+    },
+
+    headStyles: {
+      fillColor: [8,126,190],
+      textColor: 255,
+    },
+
+    columnStyles: {
+      1: { cellWidth: 220 },
+      2: { halign: "right" },
+      3: { halign: "right" },
+      4: { halign: "right" },
+    },
+  });
+
+  document.save("bank-statement-report.pdf");
+}
+
+  function exportXlsx(
+  rows = visibleRows,
+  sourceName = file?.name || "bank-statement"
+) {
+  const workbook = XLSX.utils.book_new();
+
+  // =========================
+  // DOCUMENT INFO SHEET
+  // =========================
+
+  const metadataRows = [
+    ["Field", "Value"],
+
+    ["File Name", file?.name || "-"],
+
+    ["Account Holder",
+      documentMetadata.account_holder || "-"
+    ],
+
+    ["Account Number",
+      documentMetadata.account_number || "-"
+    ],
+
+    ["Bank Name",
+      documentMetadata.bank_name || "-"
+    ],
+
+    [
+      "Statement Period",
+
+      [
+        documentMetadata.statement_period_start,
+        documentMetadata.statement_period_end,
+      ]
+        .filter(Boolean)
+        .join(" → "),
+    ],
+
+    [
+      "Statement Date",
+      documentMetadata.statement_date || "-"
+    ],
+
+    [],
+    ["Generated", new Date().toLocaleString()],
+    ["Total Transactions", rows.length],
+  ];
+
+  const metaSheet =
+    XLSX.utils.aoa_to_sheet(metadataRows);
+
+  metaSheet["!cols"] = [
+    { wch: 30 },
+    { wch: 45 },
+  ];
+
+  XLSX.utils.book_append_sheet(
+    workbook,
+    metaSheet,
+    "Document Info"
+  );
+
+  // =========================
+  // TRANSACTION SHEET
+  // =========================
+
+  const headers = [
+    "Date",
+    "Description",
+    "Debit",
+    "Credit",
+    "Balance",
+    "Type",
+    "Confidence",
+  ];
+
+  const data = rows.map((row) => [
+    row.date,
+    row.description,
+    cleanCurrencyForSheet(row.debit),
+    cleanCurrencyForSheet(row.credit),
+    cleanCurrencyForSheet(row.balance),
+    row.type,
+    row.confidence,
+  ]);
+
+  const sheet =
+    XLSX.utils.aoa_to_sheet([
+      headers,
+      ...data,
     ]);
-    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...worksheetRows]);
 
-    for (const cellAddress of Object.keys(worksheet)) {
-      if (!/^[C-E]\d+$/.test(cellAddress)) continue;
-      const cell = worksheet[cellAddress];
-      if (cell && typeof cell.v === "number") {
-        cell.z = '$#,##0.00;[Red]-$#,##0.00';
-      }
-    }
+  sheet["!cols"] = [
+    { wch: 14 },
+    { wch: 50 },
+    { wch: 15 },
+    { wch: 15 },
+    { wch: 15 },
+    { wch: 10 },
+    { wch: 12 },
+  ];
 
-    worksheet["!cols"] = [
-      { wch: 14 },
-      { wch: 52 },
-      { wch: 14 },
-      { wch: 14 },
-      { wch: 14 },
-      { wch: 10 },
-      { wch: 12 },
-    ];
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Transactions");
-    const baseName = sourceName.replace(/\.[^/.]+$/, "").replace(/[^\w-]+/g, "-") || "bank-statement";
-    downloadWorkbook(workbook, `${baseName}-transactions.xlsx`);
-  }
+  XLSX.utils.book_append_sheet(
+    workbook,
+    sheet,
+    "Transactions"
+  );
+
+  const baseName =
+    sourceName
+      .replace(/\.[^/.]+$/, "")
+      .replace(/[^\w-]+/g, "-");
+
+  downloadWorkbook(
+    workbook,
+    `${baseName}-report.xlsx`
+  );
+}
 
   function updateAuthField(field: keyof AuthForm, value: string) {
     setAuthForm((current) => ({ ...current, [field]: value }));
