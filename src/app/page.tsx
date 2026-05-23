@@ -21,7 +21,6 @@ import {
   Minimize2,
   ScanLine,
   ShieldCheck,
-  Sparkles,
   UploadCloud,
   UserCircle,
   UserPlus,
@@ -75,8 +74,11 @@ type ApiTransaction = {
   date?: string;
   description?: string;
   debit?: number | string | null;
+  debit_display?: string | null;
   credit?: number | string | null;
+  credit_display?: string | null;
   balance?: number | string | null;
+  balance_display?: string | null;
   type?: "Debit" | "Credit" | string;
   confidence?: number | string | null;
 };
@@ -130,6 +132,11 @@ function formatCurrency(value: ApiTransaction["debit"]) {
   }).format(value);
 }
 
+function formatTransactionAmount(value: ApiTransaction["debit"], displayValue?: string | null) {
+  if (displayValue && displayValue !== "-") return displayValue;
+  return formatCurrency(value);
+}
+
 function formatConfidence(value: ApiTransaction["confidence"]) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "string" && value.includes("%")) return value;
@@ -146,9 +153,9 @@ function mapApiTransaction(row: ApiTransaction, index: number): ExtractedRow {
     id: row.id || `txn-${String(index + 1).padStart(4, "0")}`,
     date: row.date || "-",
     description: row.description || "Transaction",
-    debit: formatCurrency(row.debit),
-    credit: formatCurrency(row.credit),
-    balance: formatCurrency(row.balance),
+    debit: formatTransactionAmount(row.debit, row.debit_display),
+    credit: formatTransactionAmount(row.credit, row.credit_display),
+    balance: formatTransactionAmount(row.balance, row.balance_display),
     type,
     confidence: formatConfidence(row.confidence),
   };
@@ -195,6 +202,7 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [status, setStatus] = useState<ScanStatus>("idle");
+  const [showScanner, setShowScanner] = useState(false);
   const [progress, setProgress] = useState(0);
   const [visibleRows, setVisibleRows] = useState<ExtractedRow[]>([]);
   const [documentMetadata, setDocumentMetadata] = useState<DocumentMetadata>({});
@@ -222,16 +230,6 @@ export default function Home() {
     };
   }, [previewUrl]);
 
-  useEffect(() => {
-    if (status !== "scanning") return;
-
-    const progressTimer = window.setInterval(() => {
-      setProgress((current) => Math.min(current + 5, 92));
-    }, 180);
-
-    return () => window.clearInterval(progressTimer);
-  }, [status]);
-
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const selectedFile = event.target.files?.[0];
     if (!selectedFile) return;
@@ -241,12 +239,17 @@ export default function Home() {
     setFile(selectedFile);
     setPreviewUrl(URL.createObjectURL(selectedFile));
     setStatus("scanning");
+    setShowScanner(false);
     setProgress(0);
     setVisibleRows([]);
     setDocumentMetadata({});
     setExtractionError("");
     setSavedHistoryKey(null);
     setIsTableExpanded(false);
+
+    const scannerTimer = window.setTimeout(() => {
+      setShowScanner(true);
+    }, 300);
 
     try {
       const formData = new FormData();
@@ -277,6 +280,8 @@ export default function Home() {
       setStatus("error");
       setExtractionError(error instanceof Error ? error.message : "Unable to extract transactions");
     } finally {
+      window.clearTimeout(scannerTimer);
+      setShowScanner(false);
       event.target.value = "";
     }
   }
@@ -316,7 +321,6 @@ export default function Home() {
     document.text(file?.name || "Extracted statement", 40, 60);
 
     // Add metadata section
-    let currentY = 82;
     // if (Object.keys(documentMetadata).length > 0) {
     //   document.setFontSize(9);
     //   document.setTextColor(100, 100, 100);
@@ -488,6 +492,7 @@ export default function Home() {
     setVisibleRows([]);
     setProgress(0);
     setStatus("idle");
+    setShowScanner(false);
     setHistory([]);
     setSavedHistoryKey(null);
     setIsTableExpanded(false);
@@ -594,6 +599,7 @@ export default function Home() {
     setVisibleRows(item.transactions);
     setProgress(100);
     setStatus("complete");
+    setShowScanner(false);
     setIsTableExpanded(false);
   }
 
@@ -1124,7 +1130,7 @@ export default function Home() {
                       </div>
                     )}
 
-                    {status === "scanning" && (
+                    {status === "scanning" && showScanner && (
                       <div className="pointer-events-none absolute inset-0 overflow-hidden bg-cyan-300/5">
                         <div className="scan-beam absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-transparent via-cyan-200/55 to-transparent shadow-[0_0_55px_rgba(103,232,249,0.75)]" />
                         <div className="scan-grid absolute inset-0" />
@@ -1225,7 +1231,7 @@ export default function Home() {
                             ))}
                           </AnimatePresence>
 
-                          {status === "scanning" &&
+                          {status === "scanning" && showScanner &&
                             Array.from({ length: 6 }).map((_, index) => (
                               <tr key={`skeleton-${index}`} className="bg-white/[0.02]">
                                 <td className="px-3 py-4">
