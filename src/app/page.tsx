@@ -40,6 +40,7 @@ type ExtractedRow = {
   balance: string;
   type: "Debit" | "Credit";
   confidence: string;
+  section?: string;
 };
 
 type AuthMode = "login" | "signup";
@@ -81,6 +82,7 @@ type ApiTransaction = {
   balance_display?: string | null;
   type?: "Debit" | "Credit" | string;
   confidence?: number | string | null;
+  section?: string;
 };
 
 type DocumentMetadata = {
@@ -158,6 +160,7 @@ function mapApiTransaction(row: ApiTransaction, index: number): ExtractedRow {
     balance: formatTransactionAmount(row.balance, row.balance_display),
     type,
     confidence: formatConfidence(row.confidence),
+    section: row.section || (type === "Credit" ? "Credits / Deposits" : "Debits / Withdrawals"),
   };
 }
 
@@ -533,21 +536,37 @@ function exportPdf() {
     "Confidence",
   ];
 
-  const data = rows.map((row) => [
-    row.date,
-    row.description,
-    cleanCurrencyForSheet(row.debit),
-    cleanCurrencyForSheet(row.credit),
-    cleanCurrencyForSheet(row.balance),
-    row.type,
-    row.confidence,
-  ]);
+  const sectionedRows: (string | number)[][] = [];
+  const sectionOrder: string[] = [];
+  const groupedRows = rows.reduce<Record<string, ExtractedRow[]>>((groups, row) => {
+    const section = row.section || (row.type === "Credit" ? "Credits / Deposits" : "Debits / Withdrawals");
+    if (!groups[section]) {
+      groups[section] = [];
+      sectionOrder.push(section);
+    }
+    groups[section].push(row);
+    return groups;
+  }, {});
+
+  sectionOrder.forEach((section, sectionIndex) => {
+    if (sectionIndex > 0) sectionedRows.push([]);
+    sectionedRows.push([section]);
+    sectionedRows.push(headers);
+    groupedRows[section].forEach((row) => {
+      sectionedRows.push([
+        row.date,
+        row.description,
+        cleanCurrencyForSheet(row.debit),
+        cleanCurrencyForSheet(row.credit),
+        cleanCurrencyForSheet(row.balance),
+        row.type,
+        row.confidence,
+      ]);
+    });
+  });
 
   const sheet =
-    XLSX.utils.aoa_to_sheet([
-      headers,
-      ...data,
-    ]);
+    XLSX.utils.aoa_to_sheet(sectionedRows.length ? sectionedRows : [headers]);
 
   sheet["!cols"] = [
     { wch: 14 },
