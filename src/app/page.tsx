@@ -614,28 +614,99 @@ export default function Home() {
 
   function exportSinglePdf(result: ScanResult) {
     const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
-    let y = 42;
-    doc.setFontSize(18);
-    doc.setTextColor(8, 126, 190);
-    doc.text("Bank Statement Extraction Report", 40, y);
-    y += 24;
-    doc.setFontSize(10);
-    doc.setTextColor(90);
-    doc.text(`File: ${result.originalName}`, 40, y);
-    y += 20;
     const s = stats(result.transactions);
-    doc.setFontSize(11);
-    doc.text(`Transactions: ${result.transactions.length}`, 40, y);
-    doc.text(`Debit: $${s.totalDebit.toFixed(2)}`, 230, y);
-    doc.text(`Credit: $${s.totalCredit.toFixed(2)}`, 420, y);
-    y += 25;
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 36;
+    const generatedAt = new Date().toLocaleString();
+
+    function money(value: number) {
+      return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    }
+
+    function addHeader() {
+      doc.setFillColor(11, 18, 32);
+      doc.rect(0, 0, pageWidth, 92, "F");
+      doc.setFillColor(8, 126, 190);
+      doc.rect(0, 0, 9, 92, "F");
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(22);
+      doc.setTextColor(255, 255, 255);
+      doc.text("Bank Statement Extraction Report", margin, 38);
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(188, 204, 220);
+      doc.text(`File: ${result.originalName}`, margin, 60, { maxWidth: pageWidth - 260 });
+      doc.text(`Generated: ${generatedAt}`, pageWidth - margin, 60, { align: "right" });
+    }
+
+    function addSummaryCard(label: string, value: string, x: number, y: number, width: number, accent: [number, number, number]) {
+      doc.setFillColor(248, 250, 252);
+      doc.setDrawColor(226, 232, 240);
+      doc.roundedRect(x, y, width, 50, 6, 6, "FD");
+      doc.setFillColor(...accent);
+      doc.roundedRect(x, y, 5, 50, 3, 3, "F");
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(100, 116, 139);
+      doc.text(label.toUpperCase(), x + 16, y + 18);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(14);
+      doc.setTextColor(15, 23, 42);
+      doc.text(value, x + 16, y + 38);
+    }
+
+    addHeader();
+
+    const summaryTop = 112;
+    const cardGap = 12;
+    const cardWidth = (pageWidth - margin * 2 - cardGap * 3) / 4;
+    addSummaryCard("Transactions", String(result.transactions.length), margin, summaryTop, cardWidth, [8, 126, 190]);
+    addSummaryCard("Total Debit", money(s.totalDebit), margin + (cardWidth + cardGap), summaryTop, cardWidth, [225, 29, 72]);
+    addSummaryCard("Total Credit", money(s.totalCredit), margin + (cardWidth + cardGap) * 2, summaryTop, cardWidth, [5, 150, 105]);
+    addSummaryCard("Net Flow", money(s.totalCredit - s.totalDebit), margin + (cardWidth + cardGap) * 3, summaryTop, cardWidth, [99, 102, 241]);
+
     autoTable(doc, {
-      startY: y,
+      startY: summaryTop + 72,
+      margin: { top: 36, left: margin, right: margin, bottom: 42 },
       head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"]],
       body: result.transactions.map((r) => [r.date, r.description, r.debit, r.credit, r.balance, r.type, r.confidence]),
-      styles: { fontSize: 8, cellPadding: 5, overflow: "linebreak" },
-      headStyles: { fillColor: [8, 126, 190], textColor: 255 },
-      columnStyles: { 1: { cellWidth: 220 }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" } },
+      tableWidth: pageWidth - margin * 2,
+      styles: {
+        font: "helvetica",
+        fontSize: 7.6,
+        cellPadding: { top: 5, right: 6, bottom: 5, left: 6 },
+        lineColor: [226, 232, 240],
+        lineWidth: 0.35,
+        textColor: [51, 65, 85],
+        overflow: "linebreak",
+        valign: "middle",
+      },
+      headStyles: {
+        fillColor: [8, 126, 190],
+        textColor: 255,
+        fontStyle: "bold",
+        halign: "left",
+        cellPadding: { top: 7, right: 6, bottom: 7, left: 6 },
+      },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+      columnStyles: {
+        0: { cellWidth: 72 },
+        1: { cellWidth: 270 },
+        2: { cellWidth: 78, halign: "right", textColor: [190, 18, 60] },
+        3: { cellWidth: 78, halign: "right", textColor: [4, 120, 87] },
+        4: { cellWidth: 82, halign: "right" },
+        5: { cellWidth: 62, halign: "center" },
+        6: { cellWidth: 72, halign: "center" },
+      },
+      didDrawPage: (data) => {
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.setTextColor(100, 116, 139);
+        doc.text(`Page ${data.pageNumber}`, pageWidth - margin, pageHeight - 18, { align: "right" });
+      },
     });
     doc.save(`${result.originalName.replace(/\.[^/.]+$/, "")}-report.pdf`);
   }

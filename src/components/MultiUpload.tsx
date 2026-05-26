@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   UploadCloud,
@@ -76,6 +76,7 @@ export default function MultiUpload({
 }) {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [now, setNow] = useState(Date.now());
+  const activeUploadIds = useRef(new Set<string>());
 
   useEffect(() => {
     return () => {
@@ -123,33 +124,21 @@ export default function MultiUpload({
     return Math.max(5, upload.estimatedSeconds - elapsedSeconds);
   }
 
-  function getQueueWaitSeconds(targetIndex: number) {
-    return uploads.slice(0, targetIndex).reduce((total, upload) => {
-      if (upload.status === "complete" || upload.status === "error") return total;
-      return total + getRemainingSeconds(upload);
-    }, 0);
+  function getUploadProgress(upload: UploadItem) {
+    if (upload.status === "complete") return 100;
+    if (upload.status === "error") return 0;
+    if (upload.status !== "scanning" || !upload.startedAt) return upload.progress;
+
+    const elapsedSeconds = (now - upload.startedAt) / 1000;
+    return Math.min(96, Math.max(8, Math.round((elapsedSeconds / upload.estimatedSeconds) * 100)));
   }
 
-  const totalRemainingSeconds = uploads.reduce((total, upload) => {
-    if (upload.status === "complete" || upload.status === "error") return total;
-    return total + getRemainingSeconds(upload);
+  const totalRemainingSeconds = uploads.reduce((maxRemaining, upload) => {
+    if (upload.status === "complete" || upload.status === "error") return maxRemaining;
+    return Math.max(maxRemaining, getRemainingSeconds(upload));
   }, 0);
 
-  const processQueue = useCallback(async () => {
-    const queuedIndex = uploads.findIndex((u) => u.status === "idle");
-    if (queuedIndex === -1) return;
-
-    const isScanning = uploads.some((u) => u.status === "scanning");
-    if (isScanning) return; 
-
-    const currentUpload = uploads[queuedIndex];
-
-    setUploads((current) => {
-      const next = [...current];
-      next[queuedIndex] = { ...next[queuedIndex], status: "scanning", progress: 0, startedAt: Date.now() };
-      return next;
-    });
-
+  const processUpload = useCallback(async (currentUpload: UploadItem) => {
     try {
       const formData = new FormData();
       formData.append("file", currentUpload.file);
@@ -179,19 +168,22 @@ export default function MultiUpload({
         : [];
 
       setUploads((current) => {
-        const next = [...current];
-        next[queuedIndex] = {
-          ...next[queuedIndex],
-          status: "complete",
-          progress: 100,
-          startedAt: null,
-          rows: transactions,
-          metadata: payload.data?.metadata || {},
-          isTableExpanded: true,
-        };
-        return next;
+        return current.map((upload) =>
+          upload.id === currentUpload.id
+            ? {
+                ...upload,
+                status: "complete",
+                progress: 100,
+                startedAt: null,
+                rows: transactions,
+                metadata: payload.data?.metadata || {},
+                isTableExpanded: true,
+              }
+            : upload
+        );
       });
 
+      activeUploadIds.current.delete(currentUpload.id);
       onSaveHistory({
         fileName: currentUpload.file.name,
         transactions,
@@ -202,22 +194,43 @@ export default function MultiUpload({
       });
     } catch (error) {
       setUploads((current) => {
-        const next = [...current];
-        next[queuedIndex] = {
-          ...next[queuedIndex],
-          status: "error",
-          progress: 0,
-          startedAt: null,
-          error: error instanceof Error ? error.message : "Extraction failed",
-        };
-        return next;
+        return current.map((upload) =>
+          upload.id === currentUpload.id
+            ? {
+                ...upload,
+                status: "error",
+                progress: 0,
+                startedAt: null,
+                error: error instanceof Error ? error.message : "Extraction failed",
+              }
+            : upload
+        );
       });
+      activeUploadIds.current.delete(currentUpload.id);
     }
-  }, [uploads, apiBase, onSaveHistory]);
+  }, [apiBase, onSaveHistory]);
 
   useEffect(() => {
-    processQueue();
-  }, [processQueue]);
+    const queuedUploads = uploads.filter(
+      (upload) => upload.status === "idle" && !activeUploadIds.current.has(upload.id)
+    );
+    if (queuedUploads.length === 0) return;
+
+    const startedAt = Date.now();
+    queuedUploads.forEach((upload) => activeUploadIds.current.add(upload.id));
+
+    setUploads((current) =>
+      current.map((upload) =>
+        queuedUploads.some((queued) => queued.id === upload.id)
+          ? { ...upload, status: "scanning", progress: 8, startedAt }
+          : upload
+      )
+    );
+
+    queuedUploads.forEach((upload) => {
+      void processUpload({ ...upload, status: "scanning", progress: 8, startedAt });
+    });
+  }, [uploads, processUpload]);
 
   function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files || []);
@@ -250,6 +263,7 @@ export default function MultiUpload({
   }
 
   function removeUpload(id: string) {
+    activeUploadIds.current.delete(id);
     setUploads((curr) => curr.filter((u) => u.id !== id));
   }
 
@@ -278,24 +292,107 @@ export default function MultiUpload({
 
   function exportPdf(upload: UploadItem) {
      const document = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
-     let currentY = 42;
-     document.setFontSize(18);
-     document.setTextColor(8, 126, 190);
-     document.text("Bank Statement Extraction Report", 40, currentY);
-     currentY += 24;
-     document.setFontSize(10);
-     document.setTextColor(90);
-     document.text(`File: ${upload.file.name}`, 40, currentY);
-     currentY += 20;
-     
+     const pageWidth = document.internal.pageSize.getWidth();
+     const pageHeight = document.internal.pageSize.getHeight();
+     const margin = 36;
+     const stats = calculateStats(upload.rows);
+     const generatedAt = new Date().toLocaleString();
+
+     function money(value: number) {
+       return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+     }
+
+     function addHeader() {
+       document.setFillColor(11, 18, 32);
+       document.rect(0, 0, pageWidth, 92, "F");
+       document.setFillColor(8, 126, 190);
+       document.rect(0, 0, 9, 92, "F");
+
+       document.setFont("helvetica", "bold");
+       document.setFontSize(22);
+       document.setTextColor(255, 255, 255);
+       document.text("Bank Statement Extraction Report", margin, 38);
+
+       document.setFont("helvetica", "normal");
+       document.setFontSize(9);
+       document.setTextColor(188, 204, 220);
+       document.text(`File: ${upload.file.name}`, margin, 60, { maxWidth: pageWidth - 260 });
+       document.text(`Generated: ${generatedAt}`, pageWidth - margin, 60, { align: "right" });
+     }
+
+     function addSummaryCard(label: string, value: string, x: number, y: number, width: number, accent: [number, number, number]) {
+       document.setFillColor(248, 250, 252);
+       document.setDrawColor(226, 232, 240);
+       document.roundedRect(x, y, width, 50, 6, 6, "FD");
+       document.setFillColor(...accent);
+       document.roundedRect(x, y, 5, 50, 3, 3, "F");
+       document.setFont("helvetica", "normal");
+       document.setFontSize(8);
+       document.setTextColor(100, 116, 139);
+       document.text(label.toUpperCase(), x + 16, y + 18);
+       document.setFont("helvetica", "bold");
+       document.setFontSize(14);
+       document.setTextColor(15, 23, 42);
+       document.text(value, x + 16, y + 38);
+     }
+
+     addHeader();
+
+     const summaryTop = 112;
+     const cardGap = 12;
+     const cardWidth = (pageWidth - margin * 2 - cardGap * 3) / 4;
+     addSummaryCard("Transactions", String(upload.rows.length), margin, summaryTop, cardWidth, [8, 126, 190]);
+     addSummaryCard("Total Debit", money(stats.totalDebit), margin + (cardWidth + cardGap), summaryTop, cardWidth, [225, 29, 72]);
+     addSummaryCard("Total Credit", money(stats.totalCredit), margin + (cardWidth + cardGap) * 2, summaryTop, cardWidth, [5, 150, 105]);
+     addSummaryCard("Net Flow", money(stats.totalCredit - stats.totalDebit), margin + (cardWidth + cardGap) * 3, summaryTop, cardWidth, [99, 102, 241]);
+
      autoTable(document, {
-       startY: currentY,
-       head: [["Date", "Description", "Debit", "Credit", "Balance", "Type"]],
+       startY: summaryTop + 72,
+       margin: { top: 36, left: margin, right: margin, bottom: 42 },
+       head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"]],
        body: upload.rows.map((row) => [
-         row.date, row.description, row.debit, row.credit, row.balance, row.type
+         row.date,
+         row.description,
+         row.debit,
+         row.credit,
+         row.balance,
+         row.type,
+         row.confidence,
        ]),
-       styles: { fontSize: 8, cellPadding: 5 },
-       headStyles: { fillColor: [8, 126, 190], textColor: 255 },
+       tableWidth: pageWidth - margin * 2,
+       styles: {
+         font: "helvetica",
+         fontSize: 7.6,
+         cellPadding: { top: 5, right: 6, bottom: 5, left: 6 },
+         lineColor: [226, 232, 240],
+         lineWidth: 0.35,
+         textColor: [51, 65, 85],
+         overflow: "linebreak",
+         valign: "middle",
+       },
+       headStyles: {
+         fillColor: [8, 126, 190],
+         textColor: 255,
+         fontStyle: "bold",
+         halign: "left",
+         cellPadding: { top: 7, right: 6, bottom: 7, left: 6 },
+       },
+       alternateRowStyles: { fillColor: [248, 250, 252] },
+       columnStyles: {
+         0: { cellWidth: 72 },
+         1: { cellWidth: 270 },
+         2: { cellWidth: 78, halign: "right", textColor: [190, 18, 60] },
+         3: { cellWidth: 78, halign: "right", textColor: [4, 120, 87] },
+         4: { cellWidth: 82, halign: "right" },
+         5: { cellWidth: 62, halign: "center" },
+         6: { cellWidth: 72, halign: "center" },
+       },
+       didDrawPage: (data) => {
+         document.setFont("helvetica", "normal");
+         document.setFontSize(8);
+         document.setTextColor(100, 116, 139);
+         document.text(`Page ${data.pageNumber}`, pageWidth - margin, pageHeight - 18, { align: "right" });
+       },
      });
      document.save(`${upload.file.name}-report.pdf`);
   }
@@ -317,7 +414,7 @@ export default function MultiUpload({
         <div>
           <h2 className="text-xl font-semibold text-white">Document Processing Queue</h2>
           <p className="text-sm text-slate-300 mt-1">
-            Upload up to 10 files. Estimated time remaining: {uploads.length ? formatDuration(totalRemainingSeconds) : "0s"}.
+            Upload up to 10 files. Parallel scan ETA: {uploads.length ? formatDuration(totalRemainingSeconds) : "0s"}.
           </p>
         </div>
         <label className="group relative flex cursor-pointer items-center justify-center gap-2 overflow-hidden rounded-lg bg-cyan-400 px-5 py-3 text-sm font-semibold text-slate-950 shadow-[0_0_20px_rgba(34,211,238,0.2)] transition hover:bg-cyan-300">
@@ -362,10 +459,8 @@ export default function MultiUpload({
           <AnimatePresence>
             {uploads.map((upload) => {
               const stats = calculateStats(upload.rows);
-              const uploadIndex = uploads.findIndex((item) => item.id === upload.id);
-              const waitSeconds = getQueueWaitSeconds(uploadIndex);
               const remainingSeconds = getRemainingSeconds(upload);
-              const totalEtaSeconds = waitSeconds + remainingSeconds;
+              const progress = getUploadProgress(upload);
               return (
                 <motion.div
                   key={upload.id}
@@ -432,7 +527,7 @@ export default function MultiUpload({
                             <span className="flex items-center gap-1 text-amber-200">
                               <Clock3 className="size-3" />
                               {upload.status === "idle"
-                                ? `Starts in ~${formatDuration(waitSeconds)}`
+                                ? "Starting now"
                                 : `~${formatDuration(remainingSeconds)} left`}
                             </span>
                           )}
@@ -464,14 +559,14 @@ export default function MultiUpload({
                       <div className="p-4 bg-cyan-900/10 flex-1 flex flex-col justify-center">
                         <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm">
                           <p className="text-cyan-200">Extracting transactions from statement...</p>
-                          <p className="text-amber-200">Estimated wait: {formatDuration(remainingSeconds)}</p>
+                          <p className="text-amber-200">{progress}% · {formatDuration(remainingSeconds)} left</p>
                         </div>
                         <div className="h-2 w-full overflow-hidden rounded-full bg-white/5">
                           <motion.div
                             className="h-full bg-gradient-to-r from-cyan-400 to-emerald-400"
-                            initial={{ width: "0%" }}
-                            animate={{ width: "100%" }}
-                            transition={{ duration: 5, repeat: Infinity }}
+                            initial={false}
+                            animate={{ width: `${progress}%` }}
+                            transition={{ duration: 0.35, ease: "easeOut" }}
                           />
                         </div>
                       </div>
@@ -486,9 +581,9 @@ export default function MultiUpload({
 
                     {upload.status === "idle" && (
                       <div className="p-4 flex-1 flex flex-col justify-center text-slate-400 text-sm">
-                        <p>Waiting in queue for processing...</p>
+                        <p>Preparing parallel scan...</p>
                         <p className="mt-1 text-amber-200">
-                          Estimated completion in {formatDuration(totalEtaSeconds)}
+                          Estimated completion in {formatDuration(remainingSeconds)}
                         </p>
                       </div>
                     )}
