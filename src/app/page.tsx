@@ -1376,7 +1376,7 @@ function ResultCard({
                       <th className="px-4 py-3 text-right">Debit</th>
                       <th className="px-4 py-3 text-right">Credit</th>
                       <th className="px-4 py-3 text-right">Balance</th>
-                      <th className="px-4 py-3">Conf.</th>
+                      <th className="px-4 py-3">Accuracy</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5">
