@@ -63,6 +63,7 @@ type ScanResult = {
   fileId: string;
   originalName: string;
   status: FileStatus;
+  progress: number;
   error?: string;
   transactions: ExtractedRow[];
   metadata: DocumentMetadata;
@@ -100,14 +101,6 @@ function fmt(v: number | string | null | undefined, display?: string | null) {
 
 function fmtConf(v: number | string | null | undefined) {
   if (v === null || v === undefined || v === "") return "-";
-  if (typeof v === "string" && v.includes("%")) return v;
-  const n = Number(v);
-  if (Number.isNaN(n)) return String(v);
-  return `${Math.round(n > 1 ? n : n * 100)}%`;
-}
-
-function fmtHistConf(v: HistoryItem["averageConfidence"]) {
-  if (v === null || v === undefined || v === "") return "Saved";
   if (typeof v === "string" && v.includes("%")) return v;
   const n = Number(v);
   if (Number.isNaN(n)) return String(v);
@@ -265,6 +258,7 @@ export default function Home() {
       fileId: `batch-${i}`,
       originalName: f.name,
       status: "queued",
+      progress: 0,
       transactions: [],
       metadata: {},
     }));
@@ -293,7 +287,6 @@ export default function Home() {
       let buffer = "";
 
       while (true) {
-        // eslint-disable-next-line no-await-in-loop
         let chunk: ReadableStreamReadResult<Uint8Array>;
         try {
           chunk = await reader.read();
@@ -304,7 +297,7 @@ export default function Home() {
           setResults((prev) =>
             prev.map((r) =>
               r.status === "queued" || r.status === "scanning"
-                ? { ...r, status: "error", error: "Connection lost — scan interrupted" }
+                ? { ...r, status: "error", progress: 100, error: "Connection lost — scan interrupted" }
                 : r
             )
           );
@@ -334,7 +327,7 @@ export default function Home() {
       setResults((prev) =>
         prev.map((r) =>
           r.status === "queued" || r.status === "scanning"
-            ? { ...r, status: "error", error: msg }
+            ? { ...r, status: "error", progress: 100, error: msg }
             : r
         )
       );
@@ -351,7 +344,7 @@ export default function Home() {
 
     if (event.event === "file_started") {
       setResults((prev) =>
-        prev.map((r, i) => (i === idx ? { ...r, status: "scanning" } : r))
+        prev.map((r, i) => (i === idx ? { ...r, status: "scanning", progress: Number(event.progress) || 10 } : r))
       );
       setExpandedIndex(idx);
       return;
@@ -385,6 +378,7 @@ export default function Home() {
               ? {
                   ...r,
                   status: "done",
+                  progress: 100,
                   transactions: txns,
                   metadata,
                   summary,
@@ -402,7 +396,7 @@ export default function Home() {
         setResults((prev) =>
           prev.map((r, i) =>
             i === idx
-              ? { ...r, status: "error", error: (event.error as string) || "Extraction failed" }
+              ? { ...r, status: "error", progress: 100, error: (event.error as string) || "Extraction failed" }
               : r
           )
         );
@@ -417,6 +411,20 @@ export default function Home() {
   }
 
   // ── History ───────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!isBatchRunning) return;
+    const timer = window.setInterval(() => {
+      setResults((prev) =>
+        prev.map((r) =>
+          r.status === "scanning"
+            ? { ...r, progress: Math.min(95, r.progress + 6) }
+            : r
+        )
+      );
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isBatchRunning]);
 
   async function loadHistory(user: AuthUser) {
     setHistoryLoading(true);
@@ -497,7 +505,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!authUser) return;
-    loadHistory(authUser);
+    void Promise.resolve().then(() => loadHistory(authUser));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authUser]);
 
@@ -595,6 +603,10 @@ export default function Home() {
 
   const doneCount = results.filter((r) => r.status === "done").length;
   const errorCount = results.filter((r) => r.status === "error").length;
+  const completedCount = doneCount + errorCount;
+  const scanPercent = results.length > 0
+    ? Math.round(results.reduce((acc, r) => acc + r.progress, 0) / results.length)
+    : 0;
   const totalTxns = results.reduce((acc, r) => acc + r.transactions.length, 0);
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -619,7 +631,7 @@ export default function Home() {
                 <span className="text-slate-300">Extract transactions.</span>
               </h1>
               <p className="mt-6 max-w-xl text-base leading-7 text-slate-400">
-                Upload up to 10 bank statements at once. Our OCR engine scans each one sequentially and extracts clean, structured transaction data.
+                Upload up to 10 bank statements at once. Our OCR engine scans them in parallel and streams each result as soon as it is ready.
               </p>
               <div className="mt-10 grid gap-3 sm:grid-cols-2 max-w-sm">
                 <button type="button" onClick={() => setShowAuthForm(true)}
@@ -738,10 +750,10 @@ export default function Home() {
           <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
             className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
             {[
-              { label: "Files Scanned", value: `${doneCount} / ${results.length}`, color: "cyan" },
+              { label: "Files Scanned", value: `${completedCount} / ${results.length}`, color: "cyan" },
               { label: "Total Transactions", value: totalTxns, color: "emerald" },
               { label: "Errors", value: errorCount, color: errorCount > 0 ? "rose" : "slate" },
-              { label: "Status", value: isBatchRunning ? "Scanning…" : doneCount === results.length ? "Complete" : "Partial", color: "amber" },
+              { label: "Scan Status", value: `${scanPercent}%`, color: "amber" },
             ].map(({ label, value, color }) => (
               <div key={label} className={`rounded-xl border bg-white/[0.04] p-3 border-${color}-400/15`}>
                 <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</p>
@@ -897,7 +909,7 @@ export default function Home() {
                 className="flex flex-1 flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 py-24 text-center">
                 <ScanLine className="mb-4 size-10 text-cyan-800" />
                 <p className="text-sm font-semibold text-slate-400">{queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""} ready</p>
-                <p className="mt-1 text-xs text-slate-600">Press "Start Batch Scan" to begin</p>
+                <p className="mt-1 text-xs text-slate-600">Press Start Batch Scan to begin</p>
               </motion.div>
             )}
 
@@ -979,10 +991,10 @@ function ResultCard({
             <p className="mt-0.5 truncate text-xs text-rose-400">{result.error}</p>
           )}
           {result.status === "scanning" && (
-            <p className="mt-0.5 text-xs text-cyan-500/70">Extracting transactions…</p>
+            <p className="mt-0.5 text-xs text-cyan-500/70">Extracting transactions · {result.progress}%</p>
           )}
           {result.status === "queued" && (
-            <p className="mt-0.5 text-xs text-slate-600">File {index + 1} of {total} · waiting</p>
+            <p className="mt-0.5 text-xs text-slate-600">File {index + 1} of {total} · {result.progress}%</p>
           )}
         </div>
 
@@ -1005,10 +1017,12 @@ function ResultCard({
         )}
       </div>
 
-      {/* Scanning beam */}
-      {result.status === "scanning" && (
+      {(result.status === "queued" || result.status === "scanning") && (
         <div className="relative h-1 overflow-hidden bg-white/5">
-          <div className="absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-[scan-beam_1.5s_ease-in-out_infinite] left-0" />
+          <div
+            className="h-full bg-cyan-400 transition-all duration-300"
+            style={{ width: `${Math.max(0, Math.min(100, result.progress))}%` }}
+          />
         </div>
       )}
 
