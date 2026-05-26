@@ -9,17 +9,48 @@ import {
   Loader2,
   XCircle,
   FileSpreadsheet,
-  ArrowDownToLine,
   Maximize2,
   Minimize2,
   Clock3,
-  BadgeDollarSign,
   ScanLine
 } from "lucide-react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import * as XLSX from "xlsx";
-import { ExtractedRow, DocumentMetadata, HistoryItem, AuthUser, ScanStatus } from "../types/shared";
+import { ExtractedRow, DocumentMetadata, AuthUser, ScanStatus } from "../types/shared";
+
+type ExtractedTransactionPayload = {
+  id?: string;
+  date?: string;
+  description?: string;
+  debit?: string | number;
+  debit_display?: string;
+  credit?: string | number;
+  credit_display?: string;
+  balance?: string | number;
+  balance_display?: string;
+  type?: string;
+  confidence?: string | number;
+  section?: string;
+};
+
+type UploadResponsePayload = {
+  success?: boolean;
+  message?: string;
+  data?: {
+    transactions?: ExtractedTransactionPayload[];
+    metadata?: DocumentMetadata;
+  };
+};
+
+type SavedHistoryPayload = {
+  fileName: string;
+  transactions: ExtractedRow[];
+  summary: {
+    transactionCount: number;
+    averageConfidence: number;
+  };
+};
 
 export type UploadItem = {
   id: string;
@@ -27,6 +58,8 @@ export type UploadItem = {
   previewUrl: string | null;
   status: ScanStatus;
   progress: number;
+  estimatedSeconds: number;
+  startedAt: number | null;
   rows: ExtractedRow[];
   metadata: DocumentMetadata;
   error: string;
@@ -34,15 +67,15 @@ export type UploadItem = {
 };
 
 export default function MultiUpload({
-  authUser,
   apiBase,
   onSaveHistory,
 }: {
-  authUser: any;
+  authUser: AuthUser | null;
   apiBase: string;
-  onSaveHistory: (item: any) => void;
+  onSaveHistory: (item: SavedHistoryPayload) => void;
 }) {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
     return () => {
@@ -51,6 +84,56 @@ export default function MultiUpload({
       });
     };
   }, [uploads]);
+
+  useEffect(() => {
+    if (!uploads.some((u) => u.status === "idle" || u.status === "scanning")) return;
+
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [uploads]);
+
+  function estimateExtractionSeconds(file: File) {
+    const sizeMb = Math.max(file.size / 1024 / 1024, 0.1);
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    const isPdf = file.type === "application/pdf" || extension === "pdf";
+    const baseSeconds = isPdf ? 28 : 16;
+    const secondsPerMb = isPdf ? 10 : 6;
+
+    return Math.min(600, Math.max(20, Math.ceil(baseSeconds + sizeMb * secondsPerMb)));
+  }
+
+  function formatDuration(totalSeconds: number) {
+    const seconds = Math.max(0, Math.ceil(totalSeconds));
+    if (seconds < 60) return `${seconds}s`;
+
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    if (minutes < 60) return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+
+    const hours = Math.floor(minutes / 60);
+    const minuteRemainder = minutes % 60;
+    return minuteRemainder ? `${hours}h ${minuteRemainder}m` : `${hours}h`;
+  }
+
+  function getRemainingSeconds(upload: UploadItem) {
+    if (upload.status === "complete" || upload.status === "error") return 0;
+    if (upload.status !== "scanning" || !upload.startedAt) return upload.estimatedSeconds;
+
+    const elapsedSeconds = (now - upload.startedAt) / 1000;
+    return Math.max(5, upload.estimatedSeconds - elapsedSeconds);
+  }
+
+  function getQueueWaitSeconds(targetIndex: number) {
+    return uploads.slice(0, targetIndex).reduce((total, upload) => {
+      if (upload.status === "complete" || upload.status === "error") return total;
+      return total + getRemainingSeconds(upload);
+    }, 0);
+  }
+
+  const totalRemainingSeconds = uploads.reduce((total, upload) => {
+    if (upload.status === "complete" || upload.status === "error") return total;
+    return total + getRemainingSeconds(upload);
+  }, 0);
 
   const processQueue = useCallback(async () => {
     const queuedIndex = uploads.findIndex((u) => u.status === "idle");
@@ -63,7 +146,7 @@ export default function MultiUpload({
 
     setUploads((current) => {
       const next = [...current];
-      next[queuedIndex] = { ...next[queuedIndex], status: "scanning", progress: 0 };
+      next[queuedIndex] = { ...next[queuedIndex], status: "scanning", progress: 0, startedAt: Date.now() };
       return next;
     });
 
@@ -75,22 +158,22 @@ export default function MultiUpload({
         method: "POST",
         body: formData,
       });
-      const payload = await response.json();
+      const payload = (await response.json()) as UploadResponsePayload;
 
       if (!response.ok || !payload.success) {
         throw new Error(payload.message || "Unable to extract transactions");
       }
 
-      const transactions = Array.isArray(payload.data?.transactions)
-        ? payload.data.transactions.map((row: any, i: number) => ({
+      const transactions: ExtractedRow[] = Array.isArray(payload.data?.transactions)
+        ? payload.data.transactions.map((row, i) => ({
             id: row.id || `txn-${String(i + 1).padStart(4, "0")}`,
             date: row.date || "-",
             description: row.description || "Transaction",
-            debit: row.debit_display || row.debit || "-",
-            credit: row.credit_display || row.credit || "-",
-            balance: row.balance_display || row.balance || "-",
+            debit: String(row.debit_display || row.debit || "-"),
+            credit: String(row.credit_display || row.credit || "-"),
+            balance: String(row.balance_display || row.balance || "-"),
             type: row.type === "Credit" ? "Credit" : "Debit",
-            confidence: row.confidence || "-",
+            confidence: String(row.confidence || "-"),
             section: row.section || (row.type === "Credit" ? "Credits / Deposits" : "Debits / Withdrawals"),
           }))
         : [];
@@ -101,6 +184,7 @@ export default function MultiUpload({
           ...next[queuedIndex],
           status: "complete",
           progress: 100,
+          startedAt: null,
           rows: transactions,
           metadata: payload.data?.metadata || {},
           isTableExpanded: true,
@@ -123,6 +207,7 @@ export default function MultiUpload({
           ...next[queuedIndex],
           status: "error",
           progress: 0,
+          startedAt: null,
           error: error instanceof Error ? error.message : "Extraction failed",
         };
         return next;
@@ -146,6 +231,8 @@ export default function MultiUpload({
       previewUrl: URL.createObjectURL(file), // Generate for all files including PDF
       status: "idle" as ScanStatus,
       progress: 0,
+      estimatedSeconds: estimateExtractionSeconds(file),
+      startedAt: null,
       rows: [],
       metadata: {},
       error: "",
@@ -166,7 +253,7 @@ export default function MultiUpload({
     setUploads((curr) => curr.filter((u) => u.id !== id));
   }
 
-  function calculateStats(rows: any[]) {
+  function calculateStats(rows: ExtractedRow[]) {
     let totalDebit = 0;
     let totalCredit = 0;
     let countDebit = 0;
@@ -204,7 +291,7 @@ export default function MultiUpload({
      autoTable(document, {
        startY: currentY,
        head: [["Date", "Description", "Debit", "Credit", "Balance", "Type"]],
-       body: upload.rows.map((row: any) => [
+       body: upload.rows.map((row) => [
          row.date, row.description, row.debit, row.credit, row.balance, row.type
        ]),
        styles: { fontSize: 8, cellPadding: 5 },
@@ -216,7 +303,7 @@ export default function MultiUpload({
   function exportXlsx(upload: UploadItem) {
      const workbook = XLSX.utils.book_new();
      const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type"];
-     const sheetRows = [headers, ...upload.rows.map((r: any) => [
+     const sheetRows = [headers, ...upload.rows.map((r) => [
        r.date, r.description, r.debit, r.credit, r.balance, r.type
      ])];
      const sheet = XLSX.utils.aoa_to_sheet(sheetRows);
@@ -229,7 +316,9 @@ export default function MultiUpload({
       <div className="flex items-center justify-between border-b border-white/10 pb-4">
         <div>
           <h2 className="text-xl font-semibold text-white">Document Processing Queue</h2>
-          <p className="text-sm text-slate-300 mt-1">Upload up to 10 files. They will be scanned sequentially.</p>
+          <p className="text-sm text-slate-300 mt-1">
+            Upload up to 10 files. Estimated time remaining: {uploads.length ? formatDuration(totalRemainingSeconds) : "0s"}.
+          </p>
         </div>
         <label className="group relative flex cursor-pointer items-center justify-center gap-2 overflow-hidden rounded-lg bg-cyan-400 px-5 py-3 text-sm font-semibold text-slate-950 shadow-[0_0_20px_rgba(34,211,238,0.2)] transition hover:bg-cyan-300">
           <UploadCloud className="size-5" />
@@ -273,6 +362,10 @@ export default function MultiUpload({
           <AnimatePresence>
             {uploads.map((upload) => {
               const stats = calculateStats(upload.rows);
+              const uploadIndex = uploads.findIndex((item) => item.id === upload.id);
+              const waitSeconds = getQueueWaitSeconds(uploadIndex);
+              const remainingSeconds = getRemainingSeconds(upload);
+              const totalEtaSeconds = waitSeconds + remainingSeconds;
               return (
                 <motion.div
                   key={upload.id}
@@ -288,6 +381,7 @@ export default function MultiUpload({
                         {upload.file.type === "application/pdf" ? (
                           <iframe src={`${upload.previewUrl}#toolbar=0&navpanes=0&scrollbar=0`} className="absolute inset-0 h-full w-full border-none opacity-90 object-cover" title="PDF Preview" />
                         ) : (
+                          // eslint-disable-next-line @next/next/no-img-element
                           <img src={upload.previewUrl} alt="Preview" className="absolute inset-0 h-full w-full object-cover opacity-80" />
                         )}
                         
@@ -334,6 +428,14 @@ export default function MultiUpload({
                             {upload.status.charAt(0).toUpperCase() + upload.status.slice(1)}
                           </span>
                           <span className="text-slate-500">{(upload.file.size / 1024 / 1024).toFixed(2)} MB</span>
+                          {(upload.status === "idle" || upload.status === "scanning") && (
+                            <span className="flex items-center gap-1 text-amber-200">
+                              <Clock3 className="size-3" />
+                              {upload.status === "idle"
+                                ? `Starts in ~${formatDuration(waitSeconds)}`
+                                : `~${formatDuration(remainingSeconds)} left`}
+                            </span>
+                          )}
                         </div>
                       </div>
                       
@@ -360,7 +462,10 @@ export default function MultiUpload({
 
                     {upload.status === "scanning" && (
                       <div className="p-4 bg-cyan-900/10 flex-1 flex flex-col justify-center">
-                        <p className="mb-3 text-sm text-cyan-200">Extracting transactions from statement...</p>
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm">
+                          <p className="text-cyan-200">Extracting transactions from statement...</p>
+                          <p className="text-amber-200">Estimated wait: {formatDuration(remainingSeconds)}</p>
+                        </div>
                         <div className="h-2 w-full overflow-hidden rounded-full bg-white/5">
                           <motion.div
                             className="h-full bg-gradient-to-r from-cyan-400 to-emerald-400"
@@ -381,7 +486,10 @@ export default function MultiUpload({
 
                     {upload.status === "idle" && (
                       <div className="p-4 flex-1 flex flex-col justify-center text-slate-400 text-sm">
-                        Waiting in queue for processing...
+                        <p>Waiting in queue for processing...</p>
+                        <p className="mt-1 text-amber-200">
+                          Estimated completion in {formatDuration(totalEtaSeconds)}
+                        </p>
                       </div>
                     )}
 

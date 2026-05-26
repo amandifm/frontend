@@ -64,6 +64,8 @@ type ScanResult = {
   originalName: string;
   status: FileStatus;
   progress: number;
+  estimatedSeconds: number;
+  remainingSeconds: number;
   error?: string;
   transactions: ExtractedRow[];
   metadata: DocumentMetadata;
@@ -137,6 +139,29 @@ function cleanNum(v: string) {
   if (!v || v === "-") return "";
   const n = Number(v.replace(/[$,\s]/g, ""));
   return Number.isFinite(n) ? n : v;
+}
+
+function estimateExtractionSeconds(file: File) {
+  const sizeMb = Math.max(file.size / 1024 / 1024, 0.1);
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  const isPdf = file.type === "application/pdf" || extension === "pdf";
+  const baseSeconds = isPdf ? 28 : 16;
+  const secondsPerMb = isPdf ? 10 : 6;
+
+  return Math.min(600, Math.max(20, Math.ceil(baseSeconds + sizeMb * secondsPerMb)));
+}
+
+function formatDuration(totalSeconds: number) {
+  const seconds = Math.max(0, Math.ceil(totalSeconds));
+  if (seconds < 60) return `${seconds}s`;
+
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  if (minutes < 60) return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+
+  const hours = Math.floor(minutes / 60);
+  const minuteRemainder = minutes % 60;
+  return minuteRemainder ? `${hours}h ${minuteRemainder}m` : `${hours}h`;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -230,6 +255,11 @@ export default function Home() {
     });
   }, []);
 
+  function getRemainingSeconds(result: ScanResult) {
+    if (result.status === "done" || result.status === "error") return 0;
+    return result.status === "scanning" ? result.remainingSeconds : result.estimatedSeconds;
+  }
+
   function removeQueued(idx: number) {
     setQueuedFiles((prev) => prev.filter((_, i) => i !== idx));
   }
@@ -259,6 +289,8 @@ export default function Home() {
       originalName: f.name,
       status: "queued",
       progress: 0,
+      estimatedSeconds: estimateExtractionSeconds(f),
+      remainingSeconds: estimateExtractionSeconds(f),
       transactions: [],
       metadata: {},
     }));
@@ -297,7 +329,7 @@ export default function Home() {
           setResults((prev) =>
             prev.map((r) =>
               r.status === "queued" || r.status === "scanning"
-                ? { ...r, status: "error", progress: 100, error: "Connection lost — scan interrupted" }
+                ? { ...r, status: "error", progress: 100, error: "Connection lost - scan interrupted" }
                 : r
             )
           );
@@ -344,7 +376,11 @@ export default function Home() {
 
     if (event.event === "file_started") {
       setResults((prev) =>
-        prev.map((r, i) => (i === idx ? { ...r, status: "scanning", progress: Number(event.progress) || 10 } : r))
+        prev.map((r, i) =>
+          i === idx
+            ? { ...r, status: "scanning", progress: Number(event.progress) || 10, remainingSeconds: r.remainingSeconds || r.estimatedSeconds }
+            : r
+        )
       );
       setExpandedIndex(idx);
       return;
@@ -379,6 +415,7 @@ export default function Home() {
                   ...r,
                   status: "done",
                   progress: 100,
+                  remainingSeconds: 0,
                   transactions: txns,
                   metadata,
                   summary,
@@ -396,7 +433,7 @@ export default function Home() {
         setResults((prev) =>
           prev.map((r, i) =>
             i === idx
-              ? { ...r, status: "error", progress: 100, error: (event.error as string) || "Extraction failed" }
+              ? { ...r, status: "error", progress: 100, remainingSeconds: 0, error: (event.error as string) || "Extraction failed" }
               : r
           )
         );
@@ -418,7 +455,11 @@ export default function Home() {
       setResults((prev) =>
         prev.map((r) =>
           r.status === "scanning"
-            ? { ...r, progress: Math.min(95, r.progress + 6) }
+            ? {
+                ...r,
+                progress: Math.min(95, r.progress + 6),
+                remainingSeconds: Math.max(5, r.remainingSeconds - 1),
+              }
             : r
         )
       );
@@ -713,6 +754,7 @@ export default function Home() {
 
   const hasResults = results.length > 0;
   const hasQueued = queuedFiles.length > 0;
+  const queuedEstimateSeconds = queuedFiles.reduce((total, file) => total + estimateExtractionSeconds(file), 0);
 
   return (
     <main className="min-h-screen bg-[#050814] text-white">
@@ -807,7 +849,9 @@ export default function Home() {
                   className="overflow-hidden rounded-xl border border-white/10 bg-white/[0.03]">
                   <div className="border-b border-white/8 px-4 py-3 flex items-center justify-between">
                     <p className="text-xs font-bold uppercase tracking-widest text-slate-400">Queue</p>
-                    <span className="text-xs text-slate-500">{queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""}</span>
+                    <span className="text-xs text-slate-500">
+                      {queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""} · ~{formatDuration(queuedEstimateSeconds)}
+                    </span>
                   </div>
                   <ul className="divide-y divide-white/5 max-h-[280px] overflow-y-auto">
                     {queuedFiles.map((f, i) => (
@@ -815,6 +859,9 @@ export default function Home() {
                         className="flex items-center gap-3 px-4 py-2.5">
                         <FileText className="size-4 shrink-0 text-slate-500" />
                         <span className="flex-1 truncate text-xs text-slate-300">{f.name}</span>
+                        <span className="shrink-0 rounded-md border border-amber-400/15 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold text-amber-200">
+                          ~{formatDuration(estimateExtractionSeconds(f))}
+                        </span>
                         <span className="shrink-0 text-[10px] text-slate-600">
                           {(f.size / 1024 / 1024).toFixed(1)} MB
                         </span>
@@ -909,7 +956,7 @@ export default function Home() {
                 className="flex flex-1 flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 py-24 text-center">
                 <ScanLine className="mb-4 size-10 text-cyan-800" />
                 <p className="text-sm font-semibold text-slate-400">{queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""} ready</p>
-                <p className="mt-1 text-xs text-slate-600">Press Start Batch Scan to begin</p>
+                <p className="mt-1 text-xs text-slate-600">Estimated scan time: {formatDuration(queuedEstimateSeconds)}</p>
               </motion.div>
             )}
 
@@ -920,6 +967,7 @@ export default function Home() {
                   result={result}
                   index={idx}
                   total={results.length}
+                  remainingSeconds={getRemainingSeconds(result)}
                   isExpanded={expandedIndex === idx}
                   onToggle={() => setExpandedIndex(expandedIndex === idx ? null : idx)}
                   onExportXlsx={() => exportSingleXlsx(result)}
@@ -940,6 +988,7 @@ function ResultCard({
   result,
   index,
   total,
+  remainingSeconds,
   isExpanded,
   onToggle,
   onExportXlsx,
@@ -948,6 +997,7 @@ function ResultCard({
   result: ScanResult;
   index: number;
   total: number;
+  remainingSeconds: number;
   isExpanded: boolean;
   onToggle: () => void;
   onExportXlsx: () => void;
@@ -991,10 +1041,14 @@ function ResultCard({
             <p className="mt-0.5 truncate text-xs text-rose-400">{result.error}</p>
           )}
           {result.status === "scanning" && (
-            <p className="mt-0.5 text-xs text-cyan-500/70">Extracting transactions · {result.progress}%</p>
+            <p className="mt-0.5 text-xs text-cyan-500/70">
+              Extracting transactions · {result.progress}% · ~{formatDuration(remainingSeconds)} left
+            </p>
           )}
           {result.status === "queued" && (
-            <p className="mt-0.5 text-xs text-slate-600">File {index + 1} of {total} · {result.progress}%</p>
+            <p className="mt-0.5 text-xs text-slate-600">
+              File {index + 1} of {total} · estimated {formatDuration(result.estimatedSeconds)}
+            </p>
           )}
         </div>
 
