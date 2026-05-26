@@ -1,35 +1,42 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import type { Variants } from "framer-motion";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import {
+  AlertCircle,
   ArrowDownToLine,
   BadgeDollarSign,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Clock3,
   Database,
-  Trash2,
   FileSpreadsheet,
   FileText,
   KeyRound,
+  Layers,
+  Loader2,
   LogIn,
   LogOut,
-  Loader2,
-  Maximize2,
-  Minimize2,
   ScanLine,
   ShieldCheck,
+  Trash2,
   UploadCloud,
   UserCircle,
   UserPlus,
+  X,
 } from "lucide-react";
-import Link from "next/link";
-import { ChangeEvent, FormEvent, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import * as XLSX from "xlsx";
 
-type ScanStatus = "idle" | "scanning" | "complete" | "error";
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type AuthMode = "login" | "signup";
+type AuthUser = { id: string; name: string; email: string; role?: string; isGuest?: boolean };
+type AuthForm = { name: string; email: string; password: string };
+
+type FileStatus = "queued" | "scanning" | "done" | "error";
 
 type ExtractedRow = {
   id: string;
@@ -43,20 +50,23 @@ type ExtractedRow = {
   section?: string;
 };
 
-type AuthMode = "login" | "signup";
-
-type AuthUser = {
-  id: string;
-  name: string;
-  email: string;
-  role?: string;
-  isGuest?: boolean;
+type DocumentMetadata = {
+  account_holder?: string;
+  account_number?: string;
+  bank_name?: string;
+  statement_period_start?: string;
+  statement_period_end?: string;
+  statement_date?: string;
 };
 
-type AuthForm = {
-  name: string;
-  email: string;
-  password: string;
+type ScanResult = {
+  fileId: string;
+  originalName: string;
+  status: FileStatus;
+  error?: string;
+  transactions: ExtractedRow[];
+  metadata: DocumentMetadata;
+  summary?: Record<string, unknown>;
 };
 
 type HistoryItem = {
@@ -70,618 +80,357 @@ type HistoryItem = {
   isLocal?: boolean;
 };
 
-type ApiTransaction = {
-  id?: string;
-  date?: string;
-  description?: string;
-  debit?: number | string | null;
-  debit_display?: string | null;
-  credit?: number | string | null;
-  credit_display?: string | null;
-  balance?: number | string | null;
-  balance_display?: string | null;
-  type?: "Debit" | "Credit" | string;
-  confidence?: number | string | null;
-  section?: string;
-};
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-type DocumentMetadata = {
-  account_holder?: string;
-  account_number?: string;
-  bank_name?: string;
-  statement_period_start?: string;
-  statement_period_end?: string;
-  statement_date?: string;
-};
-
-const panelVariants: Variants = {
-  hiddenLeft: { opacity: 0, x: -42, scale: 0.98 },
-  hiddenRight: { opacity: 0, x: 42, scale: 0.98 },
-  visible: {
-    opacity: 1,
-    x: 0,
-    scale: 1,
-    transition: { duration: 0.55, ease: [0.22, 1, 0.36, 1] as const },
-  },
-};
-
-function getSavedUserSnapshot() {
+function getSavedUser() {
   if (typeof window === "undefined") return null;
   return window.localStorage.getItem("difm_user");
 }
-
-function subscribeToStorage(callback: () => void) {
-  window.addEventListener("storage", callback);
-  return () => window.removeEventListener("storage", callback);
+function subscribeStorage(cb: () => void) {
+  window.addEventListener("storage", cb);
+  return () => window.removeEventListener("storage", cb);
 }
 
-function formatHistoryConfidence(value: HistoryItem["averageConfidence"]) {
-  if (value === null || value === undefined || value === "") return "Saved";
-  if (typeof value === "string" && value.includes("%")) return value;
-
-  const numeric = Number(value);
-  if (Number.isNaN(numeric)) return String(value);
-  return `${Math.round(numeric > 1 ? numeric : numeric * 100)}%`;
+function fmt(v: number | string | null | undefined, display?: string | null) {
+  if (display && display !== "-") return display;
+  if (v === null || v === undefined || v === "") return "-";
+  if (typeof v === "string") return v;
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(v);
 }
 
-function formatCurrency(value: ApiTransaction["debit"]) {
-  if (value === null || value === undefined || value === "") return "-";
-  if (typeof value === "string") return value;
-
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-  }).format(value);
+function fmtConf(v: number | string | null | undefined) {
+  if (v === null || v === undefined || v === "") return "-";
+  if (typeof v === "string" && v.includes("%")) return v;
+  const n = Number(v);
+  if (Number.isNaN(n)) return String(v);
+  return `${Math.round(n > 1 ? n : n * 100)}%`;
 }
 
-function formatTransactionAmount(value: ApiTransaction["debit"], displayValue?: string | null) {
-  if (displayValue && displayValue !== "-") return displayValue;
-  return formatCurrency(value);
+function fmtHistConf(v: HistoryItem["averageConfidence"]) {
+  if (v === null || v === undefined || v === "") return "Saved";
+  if (typeof v === "string" && v.includes("%")) return v;
+  const n = Number(v);
+  if (Number.isNaN(n)) return String(v);
+  return `${Math.round(n > 1 ? n : n * 100)}%`;
 }
 
-function formatConfidence(value: ApiTransaction["confidence"]) {
-  if (value === null || value === undefined || value === "") return "-";
-  if (typeof value === "string" && value.includes("%")) return value;
-
-  const numeric = Number(value);
-  if (Number.isNaN(numeric)) return String(value);
-  return `${Math.round(numeric > 1 ? numeric : numeric * 100)}%`;
-}
-
-function mapApiTransaction(row: ApiTransaction, index: number): ExtractedRow {
+function mapRow(row: Record<string, unknown>, idx: number): ExtractedRow {
   const type = row.type === "Credit" ? "Credit" : "Debit";
-
   return {
-    id: row.id || `txn-${String(index + 1).padStart(4, "0")}`,
-    date: row.date || "-",
-    description: row.description || "Transaction",
-    debit: formatTransactionAmount(row.debit, row.debit_display),
-    credit: formatTransactionAmount(row.credit, row.credit_display),
-    balance: formatTransactionAmount(row.balance, row.balance_display),
+    id: (row.id as string) || `txn-${String(idx + 1).padStart(4, "0")}`,
+    date: (row.date as string) || "-",
+    description: (row.description as string) || "Transaction",
+    debit: fmt(row.debit as number, row.debit_display as string),
+    credit: fmt(row.credit as number, row.credit_display as string),
+    balance: fmt(row.balance as number, row.balance_display as string),
     type,
-    confidence: formatConfidence(row.confidence),
-    section: row.section || (type === "Credit" ? "Credits / Deposits" : "Debits / Withdrawals"),
+    confidence: fmtConf(row.confidence as number),
+    section: (row.section as string) || (type === "Credit" ? "Credits / Deposits" : "Debits / Withdrawals"),
   };
 }
 
-function calculateTransactionStats(rows: ExtractedRow[]) {
-  let totalDebit = 0;
-  let totalCredit = 0;
-  let countDebit = 0;
-  let countCredit = 0;
-
-  rows.forEach((row) => {
-    const debitValue = parseFloat(row.debit.replace(/[$,\s]/g, "")) || 0;
-    const creditValue = parseFloat(row.credit.replace(/[$,\s]/g, "")) || 0;
-
-    if (debitValue > 0) {
-      totalDebit += debitValue;
-      countDebit++;
-    }
-    if (creditValue > 0) {
-      totalCredit += creditValue;
-      countCredit++;
-    }
+function stats(rows: ExtractedRow[]) {
+  let td = 0, tc = 0, nd = 0, nc = 0;
+  rows.forEach((r) => {
+    const d = parseFloat(r.debit.replace(/[$,\s]/g, "")) || 0;
+    const c = parseFloat(r.credit.replace(/[$,\s]/g, "")) || 0;
+    if (d > 0) { td += d; nd++; }
+    if (c > 0) { tc += c; nc++; }
   });
-
-  return {
-    totalDebit,
-    totalCredit,
-    netAmount: totalCredit - totalDebit,
-    countDebit,
-    countCredit,
-  };
+  return { totalDebit: td, totalCredit: tc, countDebit: nd, countCredit: nc };
 }
+
+function cleanNum(v: string) {
+  if (!v || v === "-") return "";
+  const n = Number(v.replace(/[$,\s]/g, ""));
+  return Number.isFinite(n) ? n : v;
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Home() {
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
+
+  // Auth
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [showAuthForm, setShowAuthForm] = useState(false);
-  const storedAuthUserSnapshot = useSyncExternalStore(subscribeToStorage, getSavedUserSnapshot, () => null);
+  const storedSnap = useSyncExternalStore(subscribeStorage, getSavedUser, () => null);
   const [authOverride, setAuthOverride] = useState<AuthUser | null | undefined>(undefined);
   const [authForm, setAuthForm] = useState<AuthForm>({ name: "", email: "", password: "" });
   const [authError, setAuthError] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
-  const [file, setFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [status, setStatus] = useState<ScanStatus>("idle");
-  const [showScanner, setShowScanner] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [visibleRows, setVisibleRows] = useState<ExtractedRow[]>([]);
-  const [documentMetadata, setDocumentMetadata] = useState<DocumentMetadata>({});
-  const [extractionError, setExtractionError] = useState("");
+
+  const storedUser = useMemo(() => {
+    if (!storedSnap) return null;
+    try { return JSON.parse(storedSnap) as AuthUser; } catch { return null; }
+  }, [storedSnap]);
+  const authUser = authOverride === undefined ? storedUser : authOverride;
+
+  // File batch state
+  const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
+  const [results, setResults] = useState<ScanResult[]>([]);
+  const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // History
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [savedHistoryKey, setSavedHistoryKey] = useState<string | null>(null);
-  const [isTableExpanded, setIsTableExpanded] = useState(false);
 
-  const storedAuthUser = useMemo(() => {
-    if (!storedAuthUserSnapshot) return null;
+  // ── Auth helpers ──────────────────────────────────────────────────────────
 
-    try {
-      return JSON.parse(storedAuthUserSnapshot) as AuthUser;
-    } catch {
-      return null;
-    }
-  }, [storedAuthUserSnapshot]);
-  const authUser = authOverride === undefined ? storedAuthUser : authOverride;
-  const isImage = useMemo(() => file?.type.startsWith("image/") ?? false, [file]);
-
-  useEffect(() => {
-    return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-    };
-  }, [previewUrl]);
-
-  async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    const selectedFile = event.target.files?.[0];
-    if (!selectedFile) return;
-
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-
-    setFile(selectedFile);
-    setPreviewUrl(URL.createObjectURL(selectedFile));
-    setStatus("scanning");
-    setShowScanner(false);
-    setProgress(0);
-    setVisibleRows([]);
-    setDocumentMetadata({});
-    setExtractionError("");
-    setSavedHistoryKey(null);
-    setIsTableExpanded(false);
-
-    const scannerTimer = window.setTimeout(() => {
-      setShowScanner(true);
-    }, 300);
-
-    try {
-      const formData = new FormData();
-      formData.append("file", selectedFile);
-
-      const response = await fetch(`${apiBase}/api/uploads/upload`, {
-        method: "POST",
-        body: formData,
-      });
-      const payload = await response.json();
-
-      if (!response.ok || !payload.success) {
-        throw new Error(payload.message || "Unable to extract transactions");
-      }
-
-      const transactions = Array.isArray(payload.data?.transactions)
-        ? payload.data.transactions.map(mapApiTransaction)
-        : [];
-
-      setVisibleRows(transactions);
-      setDocumentMetadata(payload.data?.metadata || {});
-      setProgress(100);
-      setStatus("complete");
-    } catch (error) {
-      setVisibleRows([]);
-      setDocumentMetadata({});
-      setProgress(0);
-      setStatus("error");
-      setExtractionError(error instanceof Error ? error.message : "Unable to extract transactions");
-    } finally {
-      window.clearTimeout(scannerTimer);
-      setShowScanner(false);
-      event.target.value = "";
-    }
-  }
-
-  function cleanCurrencyForSheet(value: string) {
-    if (!value || value === "-") return "";
-
-    const numeric = Number(value.replace(/[$,\s]/g, ""));
-    return Number.isFinite(numeric) ? numeric : value;
-  }
-
-  function downloadWorkbook(workbook: XLSX.WorkBook, fileName: string) {
-    const workbookBuffer = XLSX.write(workbook, {
-      bookType: "xlsx",
-      type: "array",
-      compression: true,
-    });
-    const blob = new Blob([workbookBuffer], {
-      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-
-    link.href = url;
-    link.download = fileName;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  }
-
-function exportPdf() {
-  const document = new jsPDF({
-    orientation: "landscape",
-    unit: "pt",
-    format: "a4",
-  });
-
-  let currentY = 42;
-
-  // Title
-  document.setFontSize(18);
-  document.setTextColor(8, 126, 190);
-  document.text("Bank Statement Extraction Report", 40, currentY);
-
-  currentY += 24;
-
-  document.setFontSize(10);
-  document.setTextColor(90);
-
-  document.text(`File: ${file?.name || "Statement"}`, 40, currentY);
-
-  currentY += 20;
-
-  // =====================
-  // DOCUMENT DETAILS
-  // =====================
-
-  if (Object.keys(documentMetadata).length > 0) {
-    document.setFillColor(245, 248, 250);
-    document.roundedRect(35, currentY - 10, 760, 90, 5, 5, "F");
-
-    document.setFontSize(11);
-    document.setTextColor(0);
-
-    const details = [
-      ["Account Holder", documentMetadata.account_holder],
-      ["Account Number", documentMetadata.account_number],
-      ["Bank Name", documentMetadata.bank_name],
-      [
-        "Statement Period",
-        [
-          documentMetadata.statement_period_start,
-          documentMetadata.statement_period_end,
-        ]
-          .filter(Boolean)
-          .join(" → "),
-      ],
-      ["Statement Date", documentMetadata.statement_date],
-    ];
-
-    let y = currentY + 10;
-
-    details.forEach(([label, value]) => {
-      if (!value) return;
-
-      document.setFont( "bold");
-      document.text(`${label}:`, 50, y);
-
-      document.setFont("normal");
-      document.text(String(value), 180, y);
-
-      y += 16;
-    });
-
-    currentY = y + 10;
-  }
-
-  // =====================
-  // SUMMARY
-  // =====================
-
-  const stats = calculateTransactionStats(visibleRows);
-
-  document.setFontSize(11);
-
-  document.text(
-    `Transactions: ${visibleRows.length}`,
-    40,
-    currentY
-  );
-
-  document.text(
-    `Debit: $${stats.totalDebit.toFixed(2)}`,
-    230,
-    currentY
-  );
-
-  document.text(
-    `Credit: $${stats.totalCredit.toFixed(2)}`,
-    420,
-    currentY
-  );
-
-  currentY += 25;
-
-  // =====================
-  // TABLE
-  // =====================
-
-  autoTable(document, {
-    startY: currentY,
-
-    head: [[
-      "Date",
-      "Description",
-      "Debit",
-      "Credit",
-      "Balance",
-      "Type",
-      "Confidence",
-    ]],
-
-    body: visibleRows.map((row) => [
-      row.date,
-      row.description,
-      row.debit,
-      row.credit,
-      row.balance,
-      row.type,
-      row.confidence,
-    ]),
-
-    styles: {
-      fontSize: 8,
-      cellPadding: 5,
-      overflow: "linebreak",
-    },
-
-    headStyles: {
-      fillColor: [8,126,190],
-      textColor: 255,
-    },
-
-    columnStyles: {
-      1: { cellWidth: 220 },
-      2: { halign: "right" },
-      3: { halign: "right" },
-      4: { halign: "right" },
-    },
-  });
-
-  document.save("bank-statement-report.pdf");
-}
-
-  function exportXlsx(
-  rows = visibleRows,
-  sourceName = file?.name || "bank-statement"
-) {
-  const workbook = XLSX.utils.book_new();
-
-  // =========================
-  // DOCUMENT INFO SHEET
-  // =========================
-
-  const metadataRows = [
-    ["Field", "Value"],
-
-    ["File Name", file?.name || "-"],
-
-    ["Account Holder",
-      documentMetadata.account_holder || "-"
-    ],
-
-    ["Account Number",
-      documentMetadata.account_number || "-"
-    ],
-
-    ["Bank Name",
-      documentMetadata.bank_name || "-"
-    ],
-
-    [
-      "Statement Period",
-
-      [
-        documentMetadata.statement_period_start,
-        documentMetadata.statement_period_end,
-      ]
-        .filter(Boolean)
-        .join(" → "),
-    ],
-
-    [
-      "Statement Date",
-      documentMetadata.statement_date || "-"
-    ],
-
-    [],
-    ["Generated", new Date().toLocaleString()],
-    ["Total Transactions", rows.length],
-  ];
-
-  const metaSheet =
-    XLSX.utils.aoa_to_sheet(metadataRows);
-
-  metaSheet["!cols"] = [
-    { wch: 30 },
-    { wch: 45 },
-  ];
-
-  XLSX.utils.book_append_sheet(
-    workbook,
-    metaSheet,
-    "Document Info"
-  );
-
-  // =========================
-  // TRANSACTION SHEET
-  // =========================
-
-  const headers = [
-    "Date",
-    "Description",
-    "Debit",
-    "Credit",
-    "Balance",
-    "Type",
-    "Confidence",
-  ];
-
-  const sectionedRows: (string | number)[][] = [];
-  const sectionOrder: string[] = [];
-  const groupedRows = rows.reduce<Record<string, ExtractedRow[]>>((groups, row) => {
-    const section = row.section || (row.type === "Credit" ? "Credits / Deposits" : "Debits / Withdrawals");
-    if (!groups[section]) {
-      groups[section] = [];
-      sectionOrder.push(section);
-    }
-    groups[section].push(row);
-    return groups;
-  }, {});
-
-  sectionOrder.forEach((section, sectionIndex) => {
-    if (sectionIndex > 0) sectionedRows.push([]);
-    sectionedRows.push([section]);
-    sectionedRows.push(headers);
-    groupedRows[section].forEach((row) => {
-      sectionedRows.push([
-        row.date,
-        row.description,
-        cleanCurrencyForSheet(row.debit),
-        cleanCurrencyForSheet(row.credit),
-        cleanCurrencyForSheet(row.balance),
-        row.type,
-        row.confidence,
-      ]);
-    });
-  });
-
-  const sheet =
-    XLSX.utils.aoa_to_sheet(sectionedRows.length ? sectionedRows : [headers]);
-
-  sheet["!cols"] = [
-    { wch: 14 },
-    { wch: 50 },
-    { wch: 15 },
-    { wch: 15 },
-    { wch: 15 },
-    { wch: 10 },
-    { wch: 12 },
-  ];
-
-  XLSX.utils.book_append_sheet(
-    workbook,
-    sheet,
-    "Transactions"
-  );
-
-  const baseName =
-    sourceName
-      .replace(/\.[^/.]+$/, "")
-      .replace(/[^\w-]+/g, "-");
-
-  downloadWorkbook(
-    workbook,
-    `${baseName}-report.xlsx`
-  );
-}
-
-  function updateAuthField(field: keyof AuthForm, value: string) {
-    setAuthForm((current) => ({ ...current, [field]: value }));
+  function updateField(f: keyof AuthForm, v: string) {
+    setAuthForm((c) => ({ ...c, [f]: v }));
     setAuthError("");
   }
 
-  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function handleAuthSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
     setAuthLoading(true);
     setAuthError("");
-
     try {
-      const endpoint = authMode === "login" ? "login" : "signup";
-      const body =
-        authMode === "login"
-          ? { email: authForm.email, password: authForm.password }
-          : authForm;
-
-      const response = await fetch(`${apiBase}/api/auth/${endpoint}`, {
+      const ep = authMode === "login" ? "login" : "signup";
+      const body = authMode === "login" ? { email: authForm.email, password: authForm.password } : authForm;
+      const res = await fetch(`${apiBase}/api/auth/${ep}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const payload = await response.json();
-
-      if (!response.ok || !payload.success) {
-        throw new Error(payload.message || "Authentication failed");
-      }
-
+      const payload = await res.json();
+      if (!res.ok || !payload.success) throw new Error(payload.message || "Authentication failed");
       const user = payload.data.user as AuthUser;
       window.localStorage.setItem("difm_user", JSON.stringify(user));
       window.localStorage.setItem("difm_token", payload.data.token);
       setAuthOverride(user);
-    } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "Authentication failed");
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Authentication failed");
     } finally {
       setAuthLoading(false);
     }
   }
 
   function continueAsGuest() {
-    const guestUser = {
-      id: "guest",
-      name: "Guest",
-      email: "guest@local",
-      isGuest: true,
-    };
-    window.localStorage.setItem("difm_user", JSON.stringify(guestUser));
+    const g = { id: "guest", name: "Guest", email: "guest@local", isGuest: true };
+    window.localStorage.setItem("difm_user", JSON.stringify(g));
     window.localStorage.removeItem("difm_token");
-    setAuthOverride(guestUser);
+    setAuthOverride(g);
   }
 
   function logout() {
     window.localStorage.removeItem("difm_user");
     window.localStorage.removeItem("difm_token");
     setAuthOverride(null);
-    setFile(null);
-    setVisibleRows([]);
-    setProgress(0);
-    setStatus("idle");
-    setShowScanner(false);
+    setQueuedFiles([]);
+    setResults([]);
     setHistory([]);
-    setSavedHistoryKey(null);
-    setIsTableExpanded(false);
   }
 
-  function localHistoryKey(user: AuthUser) {
-    return `difm_history_${user.id}`;
+  // ── File management ───────────────────────────────────────────────────────
+
+  const addFiles = useCallback((incoming: FileList | File[]) => {
+    const allowed = ["application/pdf", "image/jpeg", "image/png", "image/jpg", "image/webp"];
+    const valid = Array.from(incoming).filter((f) => allowed.includes(f.type));
+    setQueuedFiles((prev) => {
+      const combined = [...prev, ...valid];
+      return combined.slice(0, 10);
+    });
+  }, []);
+
+  function removeQueued(idx: number) {
+    setQueuedFiles((prev) => prev.filter((_, i) => i !== idx));
   }
+
+  function handleFileInput(e: ChangeEvent<HTMLInputElement>) {
+    if (e.target.files) addFiles(e.target.files);
+    e.target.value = "";
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragOver(false);
+    if (e.dataTransfer.files) addFiles(e.dataTransfer.files);
+  }
+
+  // ── Batch scanning ────────────────────────────────────────────────────────
+
+  async function startBatch() {
+    if (queuedFiles.length === 0 || isBatchRunning) return;
+
+    setIsBatchRunning(true);
+    setExpandedIndex(null);
+
+    // Initialize result slots
+    const initial: ScanResult[] = queuedFiles.map((f, i) => ({
+      fileId: `batch-${i}`,
+      originalName: f.name,
+      status: "queued",
+      transactions: [],
+      metadata: {},
+    }));
+    setResults(initial);
+
+    const formData = new FormData();
+    queuedFiles.forEach((f) => formData.append("files", f));
+
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+    try {
+      const res = await fetch(`${apiBase}/api/uploads/upload-batch`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!res.ok || !res.body) {
+        // Non-streaming error — read the message then bail
+        let errMsg = "Batch upload failed";
+        try { const p = await res.json(); errMsg = p.message || errMsg; } catch { /* ignore */ }
+        throw new Error(errMsg);
+      }
+
+      reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        // eslint-disable-next-line no-await-in-loop
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch {
+          // Stream cut mid-batch (network drop, server restart, etc.)
+          // Mark any files still pending and exit the loop gracefully —
+          // files already completed keep their results.
+          setResults((prev) =>
+            prev.map((r) =>
+              r.status === "queued" || r.status === "scanning"
+                ? { ...r, status: "error", error: "Connection lost — scan interrupted" }
+                : r
+            )
+          );
+          break;
+        }
+
+        if (chunk.done) break;
+
+        buffer += decoder.decode(chunk.value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          // Each line is fully isolated — a bad event never blocks the next file
+          try {
+            const event = JSON.parse(line);
+            handleStreamEvent(event);
+          } catch {
+            // Malformed NDJSON line — skip and continue
+          }
+        }
+      }
+    } catch (err) {
+      // Reaches here only for connection-level failures (fetch itself rejected)
+      const msg = err instanceof Error ? err.message : "Connection failed";
+      setResults((prev) =>
+        prev.map((r) =>
+          r.status === "queued" || r.status === "scanning"
+            ? { ...r, status: "error", error: msg }
+            : r
+        )
+      );
+    } finally {
+      // Always release the reader lock and unblock the UI regardless of outcome
+      try { reader?.cancel(); } catch { /* ignore */ }
+      setIsBatchRunning(false);
+      setQueuedFiles([]);
+    }
+  }
+
+  function handleStreamEvent(event: Record<string, unknown>) {
+    const idx = event.index as number;
+
+    if (event.event === "file_started") {
+      setResults((prev) =>
+        prev.map((r, i) => (i === idx ? { ...r, status: "scanning" } : r))
+      );
+      setExpandedIndex(idx);
+      return;
+    }
+
+    if (event.event === "file_done") {
+      // Always update the result — even if parsing the payload fails below,
+      // the file must leave "scanning" state so the next file can proceed.
+      if (event.success) {
+        let txns: ExtractedRow[] = [];
+        let metadata: DocumentMetadata = {};
+        let summary: Record<string, unknown> | undefined;
+        let fileId: string | undefined;
+
+        try {
+          const data = event.data as Record<string, unknown>;
+          txns = Array.isArray(data.transactions)
+            ? (data.transactions as Record<string, unknown>[]).map(mapRow)
+            : [];
+          metadata = (data.metadata as DocumentMetadata) || {};
+          summary = data.summary as Record<string, unknown>;
+          fileId = data.fileId as string | undefined;
+        } catch {
+          // Payload parse failed — treat as successful scan with 0 transactions
+          // rather than leaving the card stuck in "scanning"
+        }
+
+        setResults((prev) =>
+          prev.map((r, i) =>
+            i === idx
+              ? {
+                  ...r,
+                  status: "done",
+                  transactions: txns,
+                  metadata,
+                  summary,
+                  fileId: fileId || r.fileId,
+                }
+              : r
+          )
+        );
+
+        if (authUser) {
+          void autoSaveHistory(event.fileName as string, txns, summary);
+        }
+      } else {
+        // Extraction failed for this file — mark it and move on
+        setResults((prev) =>
+          prev.map((r, i) =>
+            i === idx
+              ? { ...r, status: "error", error: (event.error as string) || "Extraction failed" }
+              : r
+          )
+        );
+      }
+      return;
+    }
+
+    if (event.event === "batch_complete") {
+      // Server confirmed all files processed — nothing extra needed here
+      // (isBatchRunning is cleared in the finally block)
+    }
+  }
+
+  // ── History ───────────────────────────────────────────────────────────────
 
   async function loadHistory(user: AuthUser) {
     setHistoryLoading(true);
     try {
       if (user.isGuest) {
-        const saved = window.localStorage.getItem(localHistoryKey(user));
-        setHistory(saved ? JSON.parse(saved) : []);
+        const s = window.localStorage.getItem(`difm_history_${user.id}`);
+        setHistory(s ? JSON.parse(s) : []);
         return;
       }
-
       const token = window.localStorage.getItem("difm_token");
-      const response = await fetch(`${apiBase}/api/history`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const payload = await response.json();
-      if (!response.ok || !payload.success) {
-        throw new Error(payload.message || "Unable to load history");
-      }
-      setHistory(payload.data);
+      const res = await fetch(`${apiBase}/api/history`, { headers: { Authorization: `Bearer ${token}` } });
+      const p = await res.json();
+      if (!res.ok || !p.success) throw new Error(p.message);
+      setHistory(p.data);
     } catch {
       setHistory([]);
     } finally {
@@ -689,785 +438,655 @@ function exportPdf() {
     }
   }
 
-  async function saveHistoryItem() {
-    if (!authUser || !file) return;
-
-    const item = {
-      fileName: file.name,
-      transactions: visibleRows,
-      summary: {
-        transactionCount: visibleRows.length,
-        averageConfidence: 0.96,
-      },
-    };
+  async function autoSaveHistory(fileName: string, transactions: ExtractedRow[], summary: unknown) {
+    if (!authUser) return;
+    const item = { fileName, transactions, summary };
 
     if (authUser.isGuest) {
       const localItem: HistoryItem = {
         id: `local-${Date.now()}`,
-        fileName: item.fileName,
-        transactionCount: item.transactions.length,
+        fileName,
+        transactionCount: transactions.length,
         averageConfidence: "96%",
-        transactions: item.transactions,
-        summary: item.summary,
+        transactions,
+        summary: summary as Record<string, unknown>,
         createdAt: new Date().toISOString(),
         isLocal: true,
       };
-      const updated = [localItem, ...history].slice(0, 12);
-      setHistory(updated);
-      window.localStorage.setItem(localHistoryKey(authUser), JSON.stringify(updated));
-      setSavedHistoryKey(file.name);
+      setHistory((prev) => {
+        const updated = [localItem, ...prev].slice(0, 12);
+        window.localStorage.setItem(`difm_history_${authUser.id}`, JSON.stringify(updated));
+        return updated;
+      });
       return;
     }
 
     const token = window.localStorage.getItem("difm_token");
-    const response = await fetch(`${apiBase}/api/history`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(item),
-    });
-    const payload = await response.json();
-    if (response.ok && payload.success) {
-      setHistory((current) => [payload.data, ...current]);
-      setSavedHistoryKey(file.name);
+    try {
+      const res = await fetch(`${apiBase}/api/history`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(item),
+      });
+      const p = await res.json();
+      if (res.ok && p.success) {
+        setHistory((prev) => [p.data, ...prev]);
+      }
+    } catch {
+      // silent
     }
   }
 
   async function deleteHistoryItem(item: HistoryItem) {
     if (!authUser) return;
-
     if (authUser.isGuest || item.isLocal) {
-      const updated = history.filter((historyItem) => historyItem.id !== item.id);
-      setHistory(updated);
-      window.localStorage.setItem(localHistoryKey(authUser), JSON.stringify(updated));
+      setHistory((prev) => {
+        const updated = prev.filter((h) => h.id !== item.id);
+        window.localStorage.setItem(`difm_history_${authUser.id}`, JSON.stringify(updated));
+        return updated;
+      });
       return;
     }
-
     const token = window.localStorage.getItem("difm_token");
-    const response = await fetch(`${apiBase}/api/history/${item.id}`, {
+    const res = await fetch(`${apiBase}/api/history/${item.id}`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (response.ok) {
-      setHistory((current) => current.filter((historyItem) => historyItem.id !== item.id));
-    }
-  }
-
-  function restoreHistoryItem(item: HistoryItem) {
-    setFile(new File([], item.fileName, { type: "application/pdf" }));
-    setPreviewUrl(null);
-    setVisibleRows(item.transactions);
-    setProgress(100);
-    setStatus("complete");
-    setShowScanner(false);
-    setIsTableExpanded(false);
+    if (res.ok) setHistory((prev) => prev.filter((h) => h.id !== item.id));
   }
 
   useEffect(() => {
     if (!authUser) return;
-    const timer = window.setTimeout(() => loadHistory(authUser), 0);
-    return () => window.clearTimeout(timer);
+    loadHistory(authUser);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authUser]);
 
-  useEffect(() => {
-    if (status !== "complete" || !file || !authUser || savedHistoryKey === file.name) return;
-    const timer = window.setTimeout(() => saveHistoryItem(), 0);
-    return () => window.clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, file, authUser, savedHistoryKey]);
+  // ── Export helpers ────────────────────────────────────────────────────────
+
+  function exportSingleXlsx(result: ScanResult) {
+    const wb = XLSX.utils.book_new();
+    const metaRows = [
+      ["Field", "Value"],
+      ["File Name", result.originalName],
+      ["Account Holder", result.metadata.account_holder || "-"],
+      ["Account Number", result.metadata.account_number || "-"],
+      ["Bank Name", result.metadata.bank_name || "-"],
+      ["Statement Period", [result.metadata.statement_period_start, result.metadata.statement_period_end].filter(Boolean).join(" → ")],
+      ["Statement Date", result.metadata.statement_date || "-"],
+      [],
+      ["Generated", new Date().toLocaleString()],
+      ["Total Transactions", result.transactions.length],
+    ];
+    const metaSheet = XLSX.utils.aoa_to_sheet(metaRows);
+    metaSheet["!cols"] = [{ wch: 30 }, { wch: 45 }];
+    XLSX.utils.book_append_sheet(wb, metaSheet, "Document Info");
+
+    const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
+    const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, r.confidence]);
+    const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 10 }, { wch: 12 }];
+    XLSX.utils.book_append_sheet(wb, sheet, "Transactions");
+
+    const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
+    const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${result.originalName.replace(/\.[^/.]+$/, "")}-report.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportAllXlsx() {
+    const done = results.filter((r) => r.status === "done");
+    if (done.length === 0) return;
+    const wb = XLSX.utils.book_new();
+    done.forEach((result) => {
+      const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
+      const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, r.confidence]);
+      const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+      sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 12 }];
+      const sheetName = result.originalName.replace(/\.[^/.]+$/, "").slice(0, 30);
+      XLSX.utils.book_append_sheet(wb, sheet, sheetName);
+    });
+    const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
+    const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `batch-report-${Date.now()}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportSinglePdf(result: ScanResult) {
+    const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
+    let y = 42;
+    doc.setFontSize(18);
+    doc.setTextColor(8, 126, 190);
+    doc.text("Bank Statement Extraction Report", 40, y);
+    y += 24;
+    doc.setFontSize(10);
+    doc.setTextColor(90);
+    doc.text(`File: ${result.originalName}`, 40, y);
+    y += 20;
+    const s = stats(result.transactions);
+    doc.setFontSize(11);
+    doc.text(`Transactions: ${result.transactions.length}`, 40, y);
+    doc.text(`Debit: $${s.totalDebit.toFixed(2)}`, 230, y);
+    doc.text(`Credit: $${s.totalCredit.toFixed(2)}`, 420, y);
+    y += 25;
+    autoTable(doc, {
+      startY: y,
+      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"]],
+      body: result.transactions.map((r) => [r.date, r.description, r.debit, r.credit, r.balance, r.type, r.confidence]),
+      styles: { fontSize: 8, cellPadding: 5, overflow: "linebreak" },
+      headStyles: { fillColor: [8, 126, 190], textColor: 255 },
+      columnStyles: { 1: { cellWidth: 220 }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" } },
+    });
+    doc.save(`${result.originalName.replace(/\.[^/.]+$/, "")}-report.pdf`);
+  }
+
+  // ── Computed ──────────────────────────────────────────────────────────────
+
+  const doneCount = results.filter((r) => r.status === "done").length;
+  const errorCount = results.filter((r) => r.status === "error").length;
+  const totalTxns = results.reduce((acc, r) => acc + r.transactions.length, 0);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // AUTH GATE
+  // ─────────────────────────────────────────────────────────────────────────
 
   if (!authUser) {
     return (
-      <main className="min-h-screen overflow-hidden bg-[#050814] text-white">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_18%_12%,rgba(44,138,255,0.3),transparent_28%),radial-gradient(circle_at_82%_18%,rgba(20,184,166,0.24),transparent_26%),linear-gradient(135deg,#050814_0%,#09111f_44%,#111827_100%)]" />
-        <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.035)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.035)_1px,transparent_1px)] bg-[size:48px_48px] opacity-35" />
+      <main className="min-h-screen bg-[#050814] text-white overflow-hidden">
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_20%_10%,rgba(34,211,238,0.18),transparent_40%),radial-gradient(ellipse_at_80%_80%,rgba(16,185,129,0.12),transparent_40%)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:60px_60px]" />
 
-        <section
-          className={`relative mx-auto grid min-h-screen w-full items-center gap-8 px-5 py-8 transition-[max-width] duration-300 ${
-            showAuthForm ? "max-w-md" : "max-w-4xl"
-          }`}
-        >
+        <section className={`relative mx-auto grid min-h-screen items-center gap-8 px-5 py-10 transition-[max-width] duration-300 ${showAuthForm ? "max-w-sm" : "max-w-4xl"}`}>
           {!showAuthForm && (
-            <div>
-              <div className="mb-7 flex size-14 items-center justify-center rounded-lg border border-cyan-300/30 bg-cyan-300/10 shadow-[0_0_30px_rgba(34,211,238,0.16)]">
-                <ScanLine className="size-7 text-cyan-200" />
-              </div>
-              <p className="text-sm font-medium uppercase tracking-[0.3em] text-cyan-200/80">
+            <div className="fade-up">
+              <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-widest text-cyan-300">
+                <ScanLine className="size-3" />
                 DIFM Bank Extractor
-              </p>
-              <h1 className="mt-4 max-w-3xl text-4xl font-semibold tracking-tight sm:text-6xl">
-                Scan bank statements with a secure dashboard.
+              </div>
+              <h1 className="mt-2 max-w-3xl text-5xl font-bold tracking-tight sm:text-7xl leading-[1.05]">
+                <span className="shimmer-text">Scan</span> bank statements.<br />
+                <span className="text-slate-300">Extract transactions.</span>
               </h1>
-              <p className="mt-5 max-w-2xl text-base leading-7 text-slate-300">
-                Login to save your profile in Database, or continue as a guest to test the
-                statement upload and transaction extraction workflow.
+              <p className="mt-6 max-w-xl text-base leading-7 text-slate-400">
+                Upload up to 10 bank statements at once. Our OCR engine scans each one sequentially and extracts clean, structured transaction data.
               </p>
-              <div className="mt-8 grid gap-3 text-sm text-slate-200 sm:grid-cols-2">
-                <button
-                  type="button"
-                  onClick={() => setShowAuthForm(true)}
-                  className="rounded-lg border border-white/10 bg-white/[0.06] p-4 text-left transition hover:border-cyan-200/50 hover:bg-white/[0.1]"
-                >
-                  <LogIn className="mb-3 size-5 text-cyan-200" />
-                  Login / Sign up
+              <div className="mt-10 grid gap-3 sm:grid-cols-2 max-w-sm">
+                <button type="button" onClick={() => setShowAuthForm(true)}
+                  className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.06] p-4 text-left transition hover:border-cyan-400/40 hover:bg-white/[0.1]">
+                  <LogIn className="size-5 text-cyan-300 shrink-0" />
+                  <span className="text-sm font-semibold">Login / Sign up</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={continueAsGuest}
-                  className="rounded-lg border border-emerald-300/20 bg-emerald-300/10 p-4 text-left text-emerald-100 transition hover:bg-emerald-300/15"
-                >
-                  <UserCircle className="mb-3 size-5" />
-                  Continue as guest
+                <button type="button" onClick={continueAsGuest}
+                  className="flex items-center gap-3 rounded-xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-left text-emerald-100 transition hover:bg-emerald-400/15">
+                  <UserCircle className="size-5 shrink-0" />
+                  <span className="text-sm font-semibold">Continue as guest</span>
                 </button>
               </div>
             </div>
           )}
 
           <AnimatePresence mode="wait">
-            {showAuthForm ? (
-              <motion.div
-                key="auth-form"
-                initial={{ opacity: 0, x: 28, scale: 0.98 }}
-                animate={{ opacity: 1, x: 0, scale: 1 }}
-                exit={{ opacity: 0, x: 20, scale: 0.98 }}
-                transition={{ duration: 0.35 }}
-                className="rounded-lg border border-white/10 bg-slate-950/60 p-5 shadow-2xl shadow-black/30 backdrop-blur-xl"
-              >
-                <div className="mb-5">
-                  <button
-                    type="button"
-                    onClick={() => setShowAuthForm(false)}
-                    className="text-sm font-medium text-slate-300 transition hover:text-cyan-100"
-                  >
-                    Back
-                  </button>
-                  <div className="mt-5 flex items-center gap-3">
-                    <div className="flex size-11 items-center justify-center rounded-lg border border-cyan-300/30 bg-cyan-300/10">
-                      <ScanLine className="size-5 text-cyan-200" />
-                    </div>
-                    <div>
-                      <p className="text-sm font-medium text-cyan-200">DIFM Bank Extractor</p>
-                      <h1 className="text-xl font-semibold text-white">Account access</h1>
-                    </div>
+            {showAuthForm && (
+              <motion.div key="auth" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }}
+                className="rounded-2xl border border-white/10 bg-slate-950/70 p-6 shadow-2xl backdrop-blur-xl">
+                <button type="button" onClick={() => setShowAuthForm(false)}
+                  className="mb-5 text-sm font-medium text-slate-400 transition hover:text-white">← Back</button>
+                <div className="mb-6 flex items-center gap-3">
+                  <div className="flex size-10 items-center justify-center rounded-lg border border-cyan-400/30 bg-cyan-400/10">
+                    <ScanLine className="size-5 text-cyan-300" />
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-widest text-cyan-300">DIFM Extractor</p>
+                    <p className="text-lg font-bold text-white">Account access</p>
                   </div>
                 </div>
-                <div className="mb-5 grid grid-cols-2 rounded-lg bg-white/[0.06] p-1">
-                  <button
-                    type="button"
-                    onClick={() => setAuthMode("login")}
-                    className={`rounded-md px-4 py-3 text-sm font-semibold transition ${
-                      authMode === "login" ? "bg-cyan-300 text-slate-950" : "text-slate-300"
-                    }`}
-                  >
-                    Login
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAuthMode("signup")}
-                    className={`rounded-md px-4 py-3 text-sm font-semibold transition ${
-                      authMode === "signup" ? "bg-cyan-300 text-slate-950" : "text-slate-300"
-                    }`}
-                  >
-                    Sign up
-                  </button>
+                <div className="mb-5 grid grid-cols-2 rounded-xl bg-white/[0.05] p-1">
+                  {(["login", "signup"] as AuthMode[]).map((m) => (
+                    <button key={m} type="button" onClick={() => setAuthMode(m)}
+                      className={`rounded-lg py-2.5 text-sm font-semibold capitalize transition ${authMode === m ? "bg-cyan-400 text-slate-950" : "text-slate-400"}`}>
+                      {m === "login" ? "Login" : "Sign up"}
+                    </button>
+                  ))}
                 </div>
-
-                <form onSubmit={handleAuthSubmit} className="space-y-4">
+                <form onSubmit={handleAuthSubmit} className="space-y-3">
                   {authMode === "signup" && (
-                    <label className="block">
-                      <span className="mb-2 block text-sm text-slate-300">Name</span>
-                      <input
-                        value={authForm.name}
-                        onChange={(event) => updateAuthField("name", event.target.value)}
-                        className="h-12 w-full rounded-lg border border-white/10 bg-white/[0.06] px-4 text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-200"
-                        placeholder="Your name"
-                        required
-                      />
-                    </label>
+                    <input value={authForm.name} onChange={(e) => updateField("name", e.target.value)}
+                      placeholder="Your name" required
+                      className="h-11 w-full rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-400/50" />
                   )}
-                <label className="block">
-                  <span className="mb-2 block text-sm text-slate-300">Email</span>
-                  <input
-                    type="email"
-                    value={authForm.email}
-                    onChange={(event) => updateAuthField("email", event.target.value)}
-                    className="h-12 w-full rounded-lg border border-white/10 bg-white/[0.06] px-4 text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-200"
-                    placeholder="you@example.com"
-                    required
-                  />
-                </label>
-                  <label className="block">
-                    <span className="mb-2 block text-sm text-slate-300">Password</span>
-                    <input
-                      type="password"
-                      value={authForm.password}
-                      onChange={(event) => updateAuthField("password", event.target.value)}
-                      className="h-12 w-full rounded-lg border border-white/10 bg-white/[0.06] px-4 text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-200"
-                      placeholder="Minimum 6 characters"
-                      required
-                      minLength={6}
-                    />
-                  </label>
-
-                  {authError && (
-                    <p className="rounded-lg border border-rose-300/20 bg-rose-300/10 px-4 py-3 text-sm text-rose-100">
-                      {authError}
-                    </p>
-                  )}
-
-                  <button
-                    type="submit"
-                    disabled={authLoading}
-                    className="flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-cyan-300 px-5 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/20 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300"
-                  >
-                    {authLoading ? (
-                      <Loader2 className="size-4 animate-spin" />
-                    ) : authMode === "login" ? (
-                      <KeyRound className="size-4" />
-                    ) : (
-                      <UserPlus className="size-4" />
-                    )}
+                  <input type="email" value={authForm.email} onChange={(e) => updateField("email", e.target.value)}
+                    placeholder="you@example.com" required
+                    className="h-11 w-full rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-400/50" />
+                  <input type="password" value={authForm.password} onChange={(e) => updateField("password", e.target.value)}
+                    placeholder="Min. 6 characters" required minLength={6}
+                    className="h-11 w-full rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-400/50" />
+                  {authError && <p className="rounded-lg border border-rose-400/20 bg-rose-400/10 px-4 py-2.5 text-sm text-rose-200">{authError}</p>}
+                  <button type="submit" disabled={authLoading}
+                    className="flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-cyan-400 text-sm font-bold text-slate-950 transition hover:bg-cyan-300 disabled:bg-slate-600 disabled:text-slate-400">
+                    {authLoading ? <Loader2 className="size-4 animate-spin" /> : authMode === "login" ? <KeyRound className="size-4" /> : <UserPlus className="size-4" />}
                     {authMode === "login" ? "Login" : "Create account"}
                   </button>
-                  
                   <div className="flex items-center gap-3">
-                    <div className="flex-1 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
-                    <span className="text-xs uppercase tracking-wider text-slate-400">or</span>
-                    <div className="flex-1 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+                    <div className="h-px flex-1 bg-white/10" />
+                    <span className="text-xs text-slate-500">or</span>
+                    <div className="h-px flex-1 bg-white/10" />
                   </div>
-                  
-                  <Link 
-                    href="/" 
-                    onClick={continueAsGuest}
-                    className="flex h-12 w-full items-center justify-center gap-2 rounded-lg border border-emerald-300/30 bg-emerald-300/10 px-5 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300/50 hover:bg-emerald-300/20 active:bg-emerald-300/15"
-                  >
-                    <UserCircle className="size-4" />
-                    Continue as guest
-                  </Link>
+                  <button type="button" onClick={continueAsGuest}
+                    className="flex h-11 w-full items-center justify-center gap-2 rounded-lg border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-200 transition hover:bg-emerald-400/15">
+                    <UserCircle className="size-4" />Continue as guest
+                  </button>
                 </form>
               </motion.div>
-            ) : null}
+            )}
           </AnimatePresence>
         </section>
       </main>
     );
   }
 
-  return (
-    <main className="min-h-screen overflow-hidden bg-[#050814] text-white">
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_18%_12%,rgba(44,138,255,0.3),transparent_28%),radial-gradient(circle_at_82%_18%,rgba(20,184,166,0.24),transparent_26%),linear-gradient(135deg,#050814_0%,#09111f_44%,#111827_100%)]" />
-      <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.035)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.035)_1px,transparent_1px)] bg-[size:48px_48px] opacity-35" />
+  // ─────────────────────────────────────────────────────────────────────────
+  // MAIN DASHBOARD
+  // ─────────────────────────────────────────────────────────────────────────
 
-      <section className="relative mx-auto flex min-h-screen w-full max-w-7xl flex-col px-5 py-6 sm:px-8 lg:px-10">
-        <header className="flex items-center justify-between border-b border-white/10 pb-5">
+  const hasResults = results.length > 0;
+  const hasQueued = queuedFiles.length > 0;
+
+  return (
+    <main className="min-h-screen bg-[#050814] text-white">
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_10%_0%,rgba(34,211,238,0.12),transparent_35%),radial-gradient(ellipse_at_90%_100%,rgba(16,185,129,0.1),transparent_35%)]" />
+      <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px)] bg-[size:60px_60px]" />
+
+      <div className="relative mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+
+        {/* ── Header ── */}
+        <header className="mb-6 flex items-center justify-between border-b border-white/8 pb-5">
           <div className="flex items-center gap-3">
-            <div className="flex size-11 items-center justify-center rounded-lg border border-cyan-300/30 bg-cyan-300/10 shadow-[0_0_30px_rgba(34,211,238,0.16)]">
-              <ScanLine className="size-5 text-cyan-200" />
+            <div className="flex size-10 items-center justify-center rounded-xl border border-cyan-400/25 bg-cyan-400/10 shadow-[0_0_20px_rgba(34,211,238,0.12)]">
+              <ScanLine className="size-5 text-cyan-300" />
             </div>
             <div>
-              <p className="text-sm font-medium uppercase tracking-[0.28em] text-cyan-200/80">
-                DIFM Extractor
-              </p>
-              <h1 className="text-xl font-semibold tracking-tight text-white sm:text-2xl">
-                Bank Statement Transaction Extractor
-              </h1>
+              <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-cyan-400/70">DIFM Extractor</p>
+              <h1 className="text-lg font-bold text-white">Bank Statement Extractor</h1>
             </div>
           </div>
-          <div className="hidden items-center gap-3 sm:flex">
-            <div className="rounded-lg border border-emerald-300/20 bg-emerald-300/10 px-4 py-2 text-sm text-emerald-100">
-              <span className="flex items-center gap-2">
-                <ShieldCheck className="size-4" />
-                {authUser.isGuest ? "Guest session" : `Welcome, ${authUser.name}`}
-              </span>
+          <div className="flex items-center gap-2">
+            <div className="hidden items-center gap-2 rounded-lg border border-emerald-400/15 bg-emerald-400/8 px-3 py-1.5 text-xs font-semibold text-emerald-200 sm:flex">
+              <ShieldCheck className="size-3.5" />
+              {authUser.isGuest ? "Guest" : authUser.name}
             </div>
-            <button
-              type="button"
-              onClick={logout}
-              className="flex size-10 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-slate-200 transition hover:bg-white/[0.1]"
-              title="Logout"
-            >
+            <button onClick={logout}
+              className="flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05] text-slate-300 transition hover:text-white"
+              title="Logout">
               <LogOut className="size-4" />
             </button>
           </div>
         </header>
 
-        <div className="mt-5 grid gap-3 sm:grid-cols-3">
-          <div className="rounded-lg border border-white/10 bg-white/[0.05] p-4">
-            <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Dashboard</p>
-            <p className="mt-2 text-lg font-semibold text-white">{authUser.name}</p>
-          </div>
-          <div className="rounded-lg border border-white/10 bg-white/[0.05] p-4">
-            <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Account</p>
-            <p className="mt-2 truncate text-lg font-semibold text-white">{authUser.email}</p>
-          </div>
-          <div className="rounded-lg border border-white/10 bg-white/[0.05] p-4">
-            <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Mode</p>
-            <p className="mt-2 text-lg font-semibold text-white">
-              {authUser.isGuest ? "Guest preview" : "Saved PostgreSQL user"}
-            </p>
-          </div>
-        </div>
-
-        {!authUser.isGuest && (
-          <section className="mt-5 rounded-lg border border-white/10 bg-slate-950/45 p-4 shadow-xl shadow-black/20 backdrop-blur-xl">
-            <div className="mb-4 flex items-center justify-between gap-3">
-              <div>
-                <p className="text-sm font-medium text-cyan-200">History</p>
-                <h2 className="text-lg font-semibold text-white">Previous bank statement scans</h2>
+        {/* ── Stats Row ── */}
+        {hasResults && (
+          <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
+            className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {[
+              { label: "Files Scanned", value: `${doneCount} / ${results.length}`, color: "cyan" },
+              { label: "Total Transactions", value: totalTxns, color: "emerald" },
+              { label: "Errors", value: errorCount, color: errorCount > 0 ? "rose" : "slate" },
+              { label: "Status", value: isBatchRunning ? "Scanning…" : doneCount === results.length ? "Complete" : "Partial", color: "amber" },
+            ].map(({ label, value, color }) => (
+              <div key={label} className={`rounded-xl border bg-white/[0.04] p-3 border-${color}-400/15`}>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</p>
+                <p className={`mt-1 text-xl font-bold text-${color}-200`}>{value}</p>
               </div>
-              <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
-                <Database className="size-4 text-cyan-200" />
-                {history.length} saved
-              </div>
-            </div>
-
-            {historyLoading ? (
-              <div className="grid gap-3 md:grid-cols-3">
-                {Array.from({ length: 3 }).map((_, index) => (
-                  <div key={index} className="h-24 animate-pulse rounded-lg bg-white/[0.06]" />
-                ))}
-              </div>
-            ) : history.length > 0 ? (
-              <div className="grid gap-3 md:grid-cols-3">
-                {history.map((item) => (
-                  <div
-                    key={item.id}
-                    className="rounded-lg border border-white/10 bg-white/[0.05] p-4 transition hover:border-cyan-200/30 hover:bg-white/[0.08]"
-                  >
-                    <div className="mb-3 flex items-start justify-between gap-3">
-                      <button
-                        type="button"
-                        onClick={() => restoreHistoryItem(item)}
-                        className="min-w-0 text-left"
-                      >
-                        <p className="truncate text-sm font-semibold text-white">{item.fileName}</p>
-                        <p className="mt-1 flex items-center gap-2 text-xs text-slate-400">
-                          <Clock3 className="size-3" />
-                          {new Date(item.createdAt).toLocaleString()}
-                        </p>
-                      </button>
-                      <div className="flex shrink-0 gap-2">
-                        <button
-                          type="button"
-                          onClick={() => exportXlsx(item.transactions, item.fileName)}
-                          className="flex size-8 items-center justify-center rounded-md border border-cyan-200/20 bg-cyan-300/10 text-cyan-100 transition hover:bg-cyan-300/20"
-                          title="Export history as XLSX"
-                        >
-                          <FileSpreadsheet className="size-4" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => deleteHistoryItem(item)}
-                          className="flex size-8 items-center justify-center rounded-md border border-rose-300/20 bg-rose-300/10 text-rose-100 transition hover:bg-rose-300/20"
-                          title="Delete history"
-                        >
-                          <Trash2 className="size-4" />
-                        </button>
-                      </div>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-slate-300">{item.transactionCount} transactions</span>
-                      <span className="rounded-md bg-cyan-300/10 px-2 py-1 text-cyan-100">
-                        {formatHistoryConfidence(item.averageConfidence)}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="rounded-lg border border-dashed border-white/15 bg-white/[0.03] px-4 py-6 text-sm text-slate-400">
-                No previous scans yet. Upload a statement and completed scans will appear here.
-              </div>
-            )}
-          </section>
+            ))}
+          </motion.div>
         )}
 
-        <AnimatePresence mode="wait">
-          {!file ? (
-            <motion.div
-              key="upload"
-              initial={{ opacity: 0, y: 24 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -18 }}
-              transition={{ duration: 0.45 }}
-              className="grid flex-1 place-items-center py-10"
-            >
-              <label className="group relative flex w-full max-w-3xl cursor-pointer flex-col items-center justify-center overflow-hidden rounded-lg border border-dashed border-cyan-200/35 bg-white/[0.06] px-6 py-16 text-center shadow-2xl shadow-cyan-950/30 backdrop-blur-xl transition hover:border-cyan-100/70 hover:bg-white/[0.09] sm:px-12">
-                <input
-                  className="sr-only"
-                  type="file"
-                  accept=".pdf,.png,.jpg,.jpeg,.webp"
-                  onChange={handleFileChange}
-                />
-                <div className="absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-cyan-200/70 to-transparent" />
-                <div className="mb-8 flex size-24 items-center justify-center rounded-lg border border-white/15 bg-slate-950/60 shadow-[0_0_60px_rgba(34,211,238,0.22)] transition group-hover:scale-105">
-                  <UploadCloud className="size-11 text-cyan-200" />
-                </div>
-                <p className="mb-3 text-sm font-medium uppercase tracking-[0.3em] text-cyan-200/80">
-                  Upload Document
-                </p>
-                <h2 className="max-w-2xl text-4xl font-semibold tracking-tight text-white sm:text-6xl">
-                  Scan a bank statement into transactions
-                </h2>
-                <p className="mt-5 max-w-xl text-base leading-7 text-slate-300">
-                  Upload a bank statement PDF or image and extract debit, credit, balance,
-                  date, and narration details into a clean table.
-                </p>
-                <div className="mt-9 flex items-center gap-3 rounded-lg bg-cyan-300 px-5 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/20">
-                  <BadgeDollarSign className="size-4" />
-                  Choose statement
-                </div>
-              </label>
-            </motion.div>
-          ) : (
-            <motion.div
-              key="scanner"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="flex flex-1 flex-col gap-5 py-6"
-            >
-              {/* Top Stats Section - Spans Full Width */}
-              <motion.div
-                variants={panelVariants}
-                initial="hiddenRight"
-                animate="visible"
-                transition={{ delay: 0.02 }}
-                className="rounded-lg border border-white/10 bg-gradient-to-r from-cyan-500/10 via-emerald-500/10 to-blue-500/10 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
-              >
-                <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-4">
-                  {/* File Name Card */}
-                  <div className="rounded-lg border border-cyan-300/30 bg-gradient-to-br from-cyan-500/15 to-cyan-600/5 p-3">
-                    <p className="text-xs font-semibold uppercase tracking-wider text-cyan-200">File Name</p>
-                    <p className="mt-2 truncate text-sm font-bold text-white">{file?.name || "Document"}</p>
-                  </div>
+        <div className={`grid gap-5 ${hasResults ? "lg:grid-cols-[380px_1fr]" : ""}`}>
 
-                  {/* Total Transactions Card */}
-                  <div className="rounded-lg border border-emerald-300/30 bg-gradient-to-br from-emerald-500/15 to-emerald-600/5 p-3">
-                    <p className="text-xs font-semibold uppercase tracking-wider text-emerald-200">Total Transactions</p>
-                    <p className="mt-2 text-2xl font-bold text-emerald-100">{visibleRows.length}</p>
-                  </div>
+          {/* ── Left panel: Dropzone + Queue ── */}
+          <div className="flex flex-col gap-4">
 
-                  {/* Total Debit Card */}
-                  {(() => {
-                    const stats = calculateTransactionStats(visibleRows);
-                    return (
-                      <>
-                        <div className="rounded-lg border border-rose-300/30 bg-gradient-to-br from-rose-500/15 to-rose-600/5 p-3">
-                          <p className="text-xs font-semibold uppercase tracking-wider text-rose-200">Total Debit</p>
-                          <p className="mt-2 text-sm font-bold text-rose-100">
-                            $
-                            {stats.totalDebit.toLocaleString("en-US", {
-                              minimumFractionDigits: 2,
-                              maximumFractionDigits: 2,
-                            })}
-                          </p>
-                          <p className="mt-1 text-xs text-rose-300">{stats.countDebit} transactions</p>
-                        </div>
-
-                        {/* Total Credit Card */}
-                        <div className="rounded-lg border border-emerald-300/30 bg-gradient-to-br from-emerald-500/15 to-emerald-600/5 p-3">
-                          <p className="text-xs font-semibold uppercase tracking-wider text-emerald-200">Total Credit</p>
-                          <p className="mt-2 text-sm font-bold text-emerald-100">
-                            $
-                            {stats.totalCredit.toLocaleString("en-US", {
-                              minimumFractionDigits: 2,
-                              maximumFractionDigits: 2,
-                            })}
-                          </p>
-                          <p className="mt-1 text-xs text-emerald-300">{stats.countCredit} transactions</p>
-                        </div>
-                      </>
-                    );
-                  })()}
-                </div>
-
-                {/* Document Info Row */}
-                {Object.keys(documentMetadata).length > 0 && (
-                  <div className="grid grid-cols-1 gap-2 rounded-lg bg-white/[0.04] p-3 text-xs text-slate-300">
-                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                      {documentMetadata.account_holder && (
-                        <div>
-                          <span className="font-semibold text-cyan-200">Account Holder:</span>
-                          <p className="text-slate-100">{documentMetadata.account_holder}</p>
-                        </div>
-                      )}
-                      {documentMetadata.account_number && (
-                        <div>
-                          <span className="font-semibold text-cyan-200">Account Number:</span>
-                          <p className="text-slate-100">{documentMetadata.account_number}</p>
-                        </div>
-                      )}
-                      {documentMetadata.bank_name && (
-                        <div>
-                          <span className="font-semibold text-cyan-200">Bank:</span>
-                          <p className="text-slate-100">{documentMetadata.bank_name}</p>
-                        </div>
-                      )}
-                      {(documentMetadata.statement_period_start || documentMetadata.statement_period_end) && (
-                        <div>
-                          <span className="font-semibold text-cyan-200">Period:</span>
-                          <p className="text-slate-100">
-                            {[documentMetadata.statement_period_start, documentMetadata.statement_period_end]
-                              .filter(Boolean)
-                              .join(" to ")}
-                          </p>
-                        </div>
-                      )}
-                      {documentMetadata.statement_date && (
-                        <div>
-                          <span className="font-semibold text-cyan-200">Statement Date:</span>
-                          <p className="text-slate-100">{documentMetadata.statement_date}</p>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </motion.div>
-
-              {/* Content Grid - Document Preview + Transactions */}
-              <div className={`grid flex-1 gap-5 ${
-                isTableExpanded ? "" : "lg:grid-cols-[0.95fr_1.05fr]"
+            {/* Dropzone */}
+            <div
+              onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+              onDragLeave={() => setIsDragOver(false)}
+              onDrop={handleDrop}
+              onClick={() => !isBatchRunning && fileInputRef.current?.click()}
+              className={`relative flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-all ${
+                isDragOver
+                  ? "border-cyan-400/70 bg-cyan-400/8"
+                  : isBatchRunning
+                  ? "cursor-not-allowed border-white/8 bg-white/[0.02] opacity-50"
+                  : "border-white/15 bg-white/[0.03] hover:border-cyan-400/40 hover:bg-white/[0.05]"
               }`}>
-                {!isTableExpanded && (
-                  <motion.section
-                    variants={panelVariants}
-                    initial="hiddenLeft"
-                    animate="visible"
-                    className="relative overflow-hidden rounded-lg border border-white/10 bg-slate-950/55 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
-                  >
-                    <div className="mb-4 flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-medium text-cyan-200">Bank statement source</p>
-                        <h2 className="max-w-[18rem] truncate text-lg font-semibold text-white sm:max-w-sm">
-                          {file.name}
-                        </h2>
-                      </div>
-                      <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-slate-200">
-                        {status === "complete" ? (
-                          <CheckCircle2 className="size-4 text-emerald-300" />
-                        ) : status === "error" ? (
-                          <FileText className="size-4 text-rose-200" />
-                        ) : (
-                          <Loader2 className="size-4 animate-spin text-cyan-200" />
-                        )}
-                        {status === "complete" ? "Complete" : status === "error" ? "Failed" : "Scanning"}
-                      </div>
-                    </div>
+              <input ref={fileInputRef} type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp"
+                className="sr-only" onChange={handleFileInput} disabled={isBatchRunning} />
 
-                  <div className="relative min-h-[520px] overflow-hidden rounded-lg border border-white/10 bg-[#0c1220]">
-                    {isImage && previewUrl ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={previewUrl}
-                        alt="Uploaded document preview"
-                        className="h-full min-h-[520px] w-full object-contain"
-                      />
-                    ) : (
-                      <div className="grid min-h-[520px] place-items-center p-8">
-                        <div className="w-full max-w-md rounded-lg border border-white/10 bg-white/[0.06] p-7 shadow-xl">
-                          <FileText className="mb-6 size-14 text-cyan-200" />
-                          <div className="space-y-3">
-                            <div className="h-4 w-3/5 rounded bg-white/20" />
-                            <div className="h-4 w-4/5 rounded bg-white/14" />
-                            <div className="mt-7 grid grid-cols-4 gap-2">
-                              <div className="h-8 rounded bg-cyan-200/20" />
-                              <div className="h-8 rounded bg-cyan-200/20" />
-                              <div className="h-8 rounded bg-cyan-200/20" />
-                              <div className="h-8 rounded bg-cyan-200/20" />
-                            </div>
-                            {Array.from({ length: 8 }).map((_, index) => (
-                              <div key={index} className="grid grid-cols-4 gap-2">
-                                <div className="h-5 rounded bg-white/10" />
-                                <div className="h-5 rounded bg-white/10" />
-                                <div className="h-5 rounded bg-white/10" />
-                                <div className="h-5 rounded bg-white/10" />
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {status === "scanning" && showScanner && (
-                      <div className="pointer-events-none absolute inset-0 overflow-hidden bg-cyan-300/5">
-                        <div className="scan-beam absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-transparent via-cyan-200/55 to-transparent shadow-[0_0_55px_rgba(103,232,249,0.75)]" />
-                        <div className="scan-grid absolute inset-0" />
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="mt-4">
-                    <div className="mb-2 flex justify-between text-sm text-slate-300">
-                      <span>Transaction extraction progress</span>
-                      <span>{progress}%</span>
-                    </div>
-                    <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                      <motion.div
-                        className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-emerald-300 to-amber-200"
-                        animate={{ width: `${progress}%` }}
-                        transition={{ duration: 0.22 }}
-                      />
-                    </div>
-                    {extractionError && (
-                      <p className="mt-3 rounded-lg border border-rose-300/20 bg-rose-300/10 px-4 py-3 text-sm text-rose-100">
-                        {extractionError}
-                      </p>
-                    )}
-                  </div>
-                  </motion.section>
-                )}
-
-                <motion.section
-                  variants={panelVariants}
-                  initial="hiddenRight"
-                  animate="visible"
-                  transition={{ delay: 0.08 }}
-                  className="relative flex flex-col overflow-hidden rounded-lg border border-white/10 bg-slate-950/55 shadow-2xl shadow-black/30 backdrop-blur-xl"
-                >
-                  {/* Transactions Table Section */}
-                  <div className="flex flex-col p-4">
-                    <div className="mb-4 flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-medium text-cyan-200">Extracted transactions</p>
-                        <h2 className="text-base font-semibold text-white sm:text-lg">Bank statement table</h2>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setIsTableExpanded((current) => !current)}
-                        className="flex size-10 items-center justify-center rounded-lg border border-cyan-200/25 bg-cyan-300/10 text-cyan-100 transition hover:border-cyan-100/50 hover:bg-cyan-300/20"
-                        title={isTableExpanded ? "Restore dashboard layout" : "Stretch transaction dashboard"}
-                        aria-label={isTableExpanded ? "Restore dashboard layout" : "Stretch transaction dashboard"}
-                      >
-                        {isTableExpanded ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
-                      </button>
-                    </div>
-
-                    {/* Scrollable Table Container */}
-                    <div className="overflow-x-auto overflow-y-auto rounded-lg border border-white/10" style={{ maxHeight: '730px' }}>
-                      <table className="w-full min-w-[600px] border-collapse text-left">
-                        <thead className="sticky top-0 z-10 bg-white/[0.1] text-xs uppercase tracking-[0.16em] text-slate-300">
-                          <tr>
-                            <th className="w-[100px] px-3 py-4 font-medium">Date</th>
-                            <th className="w-[100px] px-3 py-4 font-medium">Description</th>
-                            <th className="w-[100px] px-3 py-4 font-medium text-right">Debit</th>
-                            <th className="w-[100px] px-3 py-4 font-medium text-right">Credit</th>
-                            <th className="w-[110px] px-3 py-4 font-medium text-right">Balance</th>
-                            <th className="w-[80px] px-3 py-4 font-medium">Accuracy</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-white/10">
-                          <AnimatePresence initial={false}>
-                            {visibleRows.map((row) => (
-                              <motion.tr
-                                key={row.id}
-                                initial={{ opacity: 0, y: 14, backgroundColor: "rgba(103,232,249,0.18)" }}
-                                animate={{ opacity: 1, y: 0, backgroundColor: "rgba(255,255,255,0.03)" }}
-                                transition={{ duration: 0.36 }}
-                                className="text-sm text-slate-100"
-                              >
-                                <td className="px-3 py-4 align-top font-medium text-white">{row.date}</td>
-                                <td className="w-[100px] overflow-hidden text-ellipsis px-3 py-4 align-top leading-5 text-slate-200" title={row.description}>
-                                  <div className="line-clamp-2 break-words">
-                                    {row.description}
-                                  </div>
-                                </td>
-                                <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-rose-200">
-                                  {row.debit}
-                                </td>
-                                <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-emerald-200">
-                                  {row.credit}
-                                </td>
-                                <td className="whitespace-nowrap px-3 py-4 text-right align-top tabular-nums text-slate-100">
-                                  {row.balance}
-                                </td>
-                                <td className="px-3 py-4">
-                                  <span className="rounded-md bg-cyan-300/10 px-2 py-1 text-xs text-cyan-100">
-                                    {row.confidence}
-                                  </span>
-                                </td>
-                              </motion.tr>
-                            ))}
-                          </AnimatePresence>
-
-                          {status === "scanning" && showScanner &&
-                            Array.from({ length: 6 }).map((_, index) => (
-                              <tr key={`skeleton-${index}`} className="bg-white/[0.02]">
-                                <td className="px-3 py-4">
-                                  <div className="h-4 w-16 animate-pulse rounded bg-white/10" />
-                                </td>
-                                <td className="px-3 py-4">
-                                  <div className="h-4 w-32 animate-pulse rounded bg-white/10" />
-                                </td>
-                                <td className="px-3 py-4">
-                                  <div className="ml-auto h-4 w-14 animate-pulse rounded bg-white/10" />
-                                </td>
-                                <td className="px-3 py-4">
-                                  <div className="ml-auto h-4 w-14 animate-pulse rounded bg-white/10" />
-                                </td>
-                                <td className="px-3 py-4">
-                                  <div className="ml-auto h-4 w-14 animate-pulse rounded bg-white/10" />
-                                </td>
-                                <td className="px-3 py-4">
-                                  <div className="h-6 w-10 animate-pulse rounded-md bg-white/10" />
-                                </td>
-                              </tr>
-                            ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                </motion.section>
+              <div className="mb-4 flex size-16 items-center justify-center rounded-2xl border border-white/10 bg-slate-900 shadow-[0_0_40px_rgba(34,211,238,0.15)]">
+                <UploadCloud className={`size-8 transition ${isDragOver ? "text-cyan-300" : "text-slate-400"}`} />
               </div>
+              <p className="text-sm font-semibold text-white">
+                {isDragOver ? "Drop files here" : "Drop files or click to browse"}
+              </p>
+              <p className="mt-1 text-xs text-slate-500">PDF, PNG, JPG, WEBP — up to 10 files · 25 MB each</p>
 
-              {/* Export Section */}
-              <motion.div
-                variants={panelVariants}
-                initial="hiddenRight"
-                animate="visible"
-                transition={{ delay: 0.12 }}
-                className="rounded-lg border border-white/10 bg-gradient-to-r from-cyan-300/[0.04] to-emerald-300/[0.04] p-4 shadow-2xl shadow-black/30 backdrop-blur-xl"
-              >
-                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="min-w-0">
-                    <div className="mb-2 flex items-center gap-2 font-medium text-cyan-100">
-                      <FileSpreadsheet className="size-4 shrink-0" />
-                      Export package
-                    </div>
-                    <p className="text-sm leading-6 text-slate-300">
-                      Debit and credit transactions with document details are prepared as PDF and XLSX files once the scan reaches 100%.
-                    </p>
+              {queuedFiles.length > 0 && (
+                <div className="mt-3 flex items-center gap-1.5 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-bold text-cyan-300">
+                  <Layers className="size-3" />
+                  {queuedFiles.length} / 10 selected
+                </div>
+              )}
+            </div>
+
+            {/* Queued file list */}
+            <AnimatePresence>
+              {hasQueued && (
+                <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
+                  className="overflow-hidden rounded-xl border border-white/10 bg-white/[0.03]">
+                  <div className="border-b border-white/8 px-4 py-3 flex items-center justify-between">
+                    <p className="text-xs font-bold uppercase tracking-widest text-slate-400">Queue</p>
+                    <span className="text-xs text-slate-500">{queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""}</span>
                   </div>
+                  <ul className="divide-y divide-white/5 max-h-[280px] overflow-y-auto">
+                    {queuedFiles.map((f, i) => (
+                      <motion.li key={`${f.name}-${i}`} initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }}
+                        className="flex items-center gap-3 px-4 py-2.5">
+                        <FileText className="size-4 shrink-0 text-slate-500" />
+                        <span className="flex-1 truncate text-xs text-slate-300">{f.name}</span>
+                        <span className="shrink-0 text-[10px] text-slate-600">
+                          {(f.size / 1024 / 1024).toFixed(1)} MB
+                        </span>
+                        <button onClick={(e) => { e.stopPropagation(); removeQueued(i); }} disabled={isBatchRunning}
+                          className="shrink-0 text-slate-600 transition hover:text-rose-400 disabled:opacity-30">
+                          <X className="size-3.5" />
+                        </button>
+                      </motion.li>
+                    ))}
+                  </ul>
 
-                  <div className="flex shrink-0 gap-2">
-                    <button
-                      type="button"
-                      onClick={exportPdf}
-                      disabled={status !== "complete"}
-                      className="flex min-w-24 items-center justify-center gap-2 rounded-lg border border-cyan-200/25 bg-white/[0.08] px-4 py-3 text-sm font-semibold text-cyan-100 transition hover:bg-white/[0.12] disabled:cursor-not-allowed disabled:border-transparent disabled:bg-slate-600 disabled:text-slate-300"
-                    >
-                      <FileText className="size-4" />
-                      PDF
+                  <div className="border-t border-white/8 p-3">
+                    <button onClick={startBatch} disabled={isBatchRunning || queuedFiles.length === 0}
+                      className="flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-400 py-2.5 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400 disabled:shadow-none">
+                      {isBatchRunning ? (
+                        <><Loader2 className="size-4 animate-spin" /> Scanning…</>
+                      ) : (
+                        <><ScanLine className="size-4" /> Start Batch Scan</>
+                      )}
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => exportXlsx()}
-                      disabled={status !== "complete"}
-                      className="flex min-w-24 items-center justify-center gap-2 rounded-lg bg-cyan-300 px-4 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 disabled:shadow-none"
-                    >
-                      <ArrowDownToLine className="size-4" />
-                      XLSX
-                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Export all */}
+            {doneCount > 1 && !isBatchRunning && (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
+                <p className="mb-3 text-xs font-bold uppercase tracking-widest text-slate-400">Export All Results</p>
+                <button onClick={exportAllXlsx}
+                  className="flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 py-2.5 text-sm font-bold text-white shadow-lg shadow-emerald-500/20 transition hover:bg-emerald-400">
+                  <ArrowDownToLine className="size-4" />
+                  Download All as XLSX
+                </button>
+              </motion.div>
+            )}
+
+            {/* Scan history */}
+            {!authUser.isGuest && (
+              <div className="rounded-xl border border-white/10 bg-white/[0.03]">
+                <div className="border-b border-white/8 px-4 py-3 flex items-center justify-between">
+                  <p className="text-xs font-bold uppercase tracking-widest text-slate-400">History</p>
+                  <div className="flex items-center gap-1.5 text-xs text-slate-500">
+                    <Database className="size-3" />{history.length}
                   </div>
                 </div>
+                {historyLoading ? (
+                  <div className="p-3 space-y-2">
+                    {[1, 2, 3].map((i) => <div key={i} className="h-12 animate-pulse rounded-lg bg-white/[0.05]" />)}
+                  </div>
+                ) : history.length > 0 ? (
+                  <ul className="divide-y divide-white/5 max-h-[320px] overflow-y-auto">
+                    {history.map((item) => (
+                      <li key={item.id} className="flex items-center gap-3 px-4 py-3">
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-xs font-semibold text-white">{item.fileName}</p>
+                          <p className="flex items-center gap-1 text-[10px] text-slate-500">
+                            <Clock3 className="size-2.5" />
+                            {new Date(item.createdAt).toLocaleDateString()}
+                            <span className="ml-1 text-cyan-400/70">{item.transactionCount} txns</span>
+                          </p>
+                        </div>
+                        <button onClick={() => deleteHistoryItem(item)}
+                          className="shrink-0 text-slate-600 transition hover:text-rose-400">
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="px-4 py-6 text-center text-xs text-slate-600">No history yet</p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ── Right panel: Results ── */}
+          <div className="flex flex-col gap-4">
+
+            {!hasResults && !hasQueued && (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                className="flex flex-1 flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 py-24 text-center">
+                <BadgeDollarSign className="mb-4 size-10 text-slate-700" />
+                <p className="text-sm font-semibold text-slate-500">No scans yet</p>
+                <p className="mt-1 text-xs text-slate-700">Add files on the left and start a batch scan</p>
               </motion.div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </section>
+            )}
+
+            {!hasResults && hasQueued && (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                className="flex flex-1 flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 py-24 text-center">
+                <ScanLine className="mb-4 size-10 text-cyan-800" />
+                <p className="text-sm font-semibold text-slate-400">{queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""} ready</p>
+                <p className="mt-1 text-xs text-slate-600">Press "Start Batch Scan" to begin</p>
+              </motion.div>
+            )}
+
+            <AnimatePresence>
+              {results.map((result, idx) => (
+                <ResultCard
+                  key={`${result.originalName}-${idx}`}
+                  result={result}
+                  index={idx}
+                  total={results.length}
+                  isExpanded={expandedIndex === idx}
+                  onToggle={() => setExpandedIndex(expandedIndex === idx ? null : idx)}
+                  onExportXlsx={() => exportSingleXlsx(result)}
+                  onExportPdf={() => exportSinglePdf(result)}
+                />
+              ))}
+            </AnimatePresence>
+          </div>
+        </div>
+      </div>
     </main>
+  );
+}
+
+// ─── ResultCard component ─────────────────────────────────────────────────────
+
+function ResultCard({
+  result,
+  index,
+  total,
+  isExpanded,
+  onToggle,
+  onExportXlsx,
+  onExportPdf,
+}: {
+  result: ScanResult;
+  index: number;
+  total: number;
+  isExpanded: boolean;
+  onToggle: () => void;
+  onExportXlsx: () => void;
+  onExportPdf: () => void;
+}) {
+  const s = stats(result.transactions);
+  const statusColor = result.status === "done" ? "emerald" : result.status === "error" ? "rose" : result.status === "scanning" ? "cyan" : "slate";
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: index * 0.05 }}
+      className="overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03] shadow-lg">
+
+      {/* Card header */}
+      <div className="flex items-center gap-3 px-4 py-3.5">
+        {/* Status icon */}
+        <div className={`flex size-8 shrink-0 items-center justify-center rounded-lg border border-${statusColor}-400/20 bg-${statusColor}-400/10`}>
+          {result.status === "scanning" && <Loader2 className="size-4 animate-spin text-cyan-300" />}
+          {result.status === "done" && <CheckCircle2 className="size-4 text-emerald-300" />}
+          {result.status === "error" && <AlertCircle className="size-4 text-rose-300" />}
+          {result.status === "queued" && <Clock3 className="size-4 text-slate-500" />}
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <p className="truncate text-sm font-semibold text-white">{result.originalName}</p>
+            <span className={`shrink-0 rounded-md border border-${statusColor}-400/20 bg-${statusColor}-400/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-${statusColor}-300`}>
+              {result.status === "scanning" ? "Scanning" : result.status === "done" ? "Complete" : result.status === "error" ? "Failed" : "Queued"}
+            </span>
+          </div>
+          {result.status === "done" && (
+            <p className="mt-0.5 text-xs text-slate-500">
+              {result.transactions.length} transactions
+              {result.metadata.bank_name && ` · ${result.metadata.bank_name}`}
+              {result.metadata.statement_period_start && ` · ${result.metadata.statement_period_start}`}
+            </p>
+          )}
+          {result.status === "error" && (
+            <p className="mt-0.5 truncate text-xs text-rose-400">{result.error}</p>
+          )}
+          {result.status === "scanning" && (
+            <p className="mt-0.5 text-xs text-cyan-500/70">Extracting transactions…</p>
+          )}
+          {result.status === "queued" && (
+            <p className="mt-0.5 text-xs text-slate-600">File {index + 1} of {total} · waiting</p>
+          )}
+        </div>
+
+        {/* Actions */}
+        {result.status === "done" && (
+          <div className="flex shrink-0 items-center gap-2">
+            <button onClick={onExportPdf}
+              className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.1]">
+              <FileText className="size-3.5" />PDF
+            </button>
+            <button onClick={onExportXlsx}
+              className="flex items-center gap-1.5 rounded-lg bg-cyan-400 px-2.5 py-1.5 text-xs font-bold text-slate-950 transition hover:bg-cyan-300">
+              <FileSpreadsheet className="size-3.5" />XLSX
+            </button>
+            <button onClick={onToggle}
+              className="flex size-7 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05] text-slate-400 transition hover:text-white">
+              {isExpanded ? <ChevronUp className="size-4" /> : <ChevronDown className="size-4" />}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Scanning beam */}
+      {result.status === "scanning" && (
+        <div className="relative h-1 overflow-hidden bg-white/5">
+          <div className="absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-[scan-beam_1.5s_ease-in-out_infinite] left-0" />
+        </div>
+      )}
+
+      {/* Expanded: mini stats + table */}
+      <AnimatePresence>
+        {isExpanded && result.status === "done" && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.25 }}
+            className="overflow-hidden border-t border-white/8">
+
+            {/* Stats strip */}
+            <div className="grid grid-cols-3 divide-x divide-white/8 border-b border-white/8">
+              {[
+                { label: "Transactions", value: result.transactions.length, className: "text-white" },
+                { label: "Total Debit", value: `$${s.totalDebit.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, className: "text-rose-300" },
+                { label: "Total Credit", value: `$${s.totalCredit.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, className: "text-emerald-300" },
+              ].map(({ label, value, className }) => (
+                <div key={label} className="px-4 py-3 text-center">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">{label}</p>
+                  <p className={`mt-1 text-base font-bold ${className}`}>{value}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* Metadata */}
+            {Object.keys(result.metadata).some((k) => result.metadata[k as keyof DocumentMetadata]) && (
+              <div className="flex flex-wrap gap-x-6 gap-y-1 border-b border-white/8 px-4 py-2.5">
+                {[
+                  ["Holder", result.metadata.account_holder],
+                  ["Account", result.metadata.account_number],
+                  ["Bank", result.metadata.bank_name],
+                  ["Date", result.metadata.statement_date],
+                ].filter(([, v]) => v).map(([label, value]) => (
+                  <div key={label} className="text-xs">
+                    <span className="font-semibold text-slate-500">{label}: </span>
+                    <span className="text-slate-300">{value}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Transaction table */}
+            <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
+              <table className="w-full min-w-[560px] border-collapse text-left text-xs">
+                <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                  <tr>
+                    <th className="px-4 py-3">Date</th>
+                    <th className="px-4 py-3">Description</th>
+                    <th className="px-4 py-3 text-right">Debit</th>
+                    <th className="px-4 py-3 text-right">Credit</th>
+                    <th className="px-4 py-3 text-right">Balance</th>
+                    <th className="px-4 py-3">Conf.</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {result.transactions.map((row) => (
+                    <tr key={row.id} className="transition hover:bg-white/[0.03]">
+                      <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
+                      <td className="max-w-[200px] px-4 py-2.5 text-slate-300">
+                        <div className="line-clamp-2">{row.description}</div>
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
+                      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
+                      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
+                      <td className="px-4 py-2.5">
+                        <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
   );
 }
