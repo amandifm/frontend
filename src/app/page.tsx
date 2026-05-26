@@ -14,6 +14,7 @@ import {
   Database,
   FileSpreadsheet,
   FileText,
+  Filter,
   KeyRound,
   Layers,
   Loader2,
@@ -139,6 +140,45 @@ function cleanNum(v: string) {
   if (!v || v === "-") return "";
   const n = Number(v.replace(/[$,\s]/g, ""));
   return Number.isFinite(n) ? n : v;
+}
+
+function money(value: number) {
+  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function amountValue(value: string) {
+  if (!value || value === "-") return 0;
+  return parseFloat(value.replace(/[$,\s]/g, "")) || 0;
+}
+
+function transactionTime(row: ExtractedRow, index: number) {
+  const raw = row.date?.trim();
+  if (!raw || raw === "-") return Number.MAX_SAFE_INTEGER - index;
+
+  const normalized = raw.replace(/-/g, "/");
+  const parts = normalized.split("/").map((p) => Number(p));
+  if (parts.length >= 3 && parts.every(Number.isFinite)) {
+    const [a, b, c] = parts;
+    const year = c < 100 ? 2000 + c : c;
+    return new Date(year, a - 1, b).getTime();
+  }
+  if (parts.length === 2 && parts.every(Number.isFinite)) {
+    const [month, day] = parts;
+    return new Date(2000, month - 1, day).getTime();
+  }
+
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? Number.MAX_SAFE_INTEGER - index : parsed;
+}
+
+function sortRowsByDate(rows: ExtractedRow[]) {
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => {
+      const diff = transactionTime(a.row, a.index) - transactionTime(b.row, b.index);
+      return diff || a.index - b.index;
+    })
+    .map(({ row }) => row);
 }
 
 function estimateExtractionSeconds(file: File) {
@@ -720,6 +760,7 @@ export default function Home() {
     ? Math.round(results.reduce((acc, r) => acc + r.progress, 0) / results.length)
     : 0;
   const totalTxns = results.reduce((acc, r) => acc + r.transactions.length, 0);
+  const allStats = stats(results.flatMap((r) => r.transactions));
 
   // ─────────────────────────────────────────────────────────────────────────
   // AUTH GATE
@@ -861,16 +902,18 @@ export default function Home() {
         {/* ── Stats Row ── */}
         {hasResults && (
           <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
-            className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
             {[
-              { label: "Files Scanned", value: `${completedCount} / ${results.length}`, color: "cyan" },
-              { label: "Total Transactions", value: totalTxns, color: "emerald" },
-              { label: "Errors", value: errorCount, color: errorCount > 0 ? "rose" : "slate" },
-              { label: "Scan Status", value: `${scanPercent}%`, color: "amber" },
-            ].map(({ label, value, color }) => (
-              <div key={label} className={`rounded-xl border bg-white/[0.04] p-3 border-${color}-400/15`}>
+              { label: "Files Scanned", value: `${completedCount} / ${results.length}`, border: "border-cyan-400/15", text: "text-cyan-200" },
+              { label: "Total Transactions", value: totalTxns, border: "border-emerald-400/15", text: "text-emerald-200" },
+              { label: "Total Credit", value: money(allStats.totalCredit), border: "border-emerald-400/15", text: "text-emerald-300" },
+              { label: "Total Debit", value: money(allStats.totalDebit), border: "border-rose-400/15", text: "text-rose-300" },
+              { label: "Errors", value: errorCount, border: errorCount > 0 ? "border-rose-400/15" : "border-slate-400/15", text: errorCount > 0 ? "text-rose-200" : "text-slate-200" },
+              { label: "Scan Status", value: `${scanPercent}%`, border: "border-amber-400/15", text: "text-amber-200" },
+            ].map(({ label, value, border, text }) => (
+              <div key={label} className={`rounded-xl border bg-white/[0.04] p-3 ${border}`}>
                 <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</p>
-                <p className={`mt-1 text-xl font-bold text-${color}-200`}>{value}</p>
+                <p className={`mt-1 text-xl font-bold ${text}`}>{value}</p>
               </div>
             ))}
           </motion.div>
@@ -1055,6 +1098,101 @@ export default function Home() {
 
 // ─── ResultCard component ─────────────────────────────────────────────────────
 
+function exportSplitTable(result: ScanResult, kind: "Debit" | "Credit", rows: ExtractedRow[]) {
+  const wb = XLSX.utils.book_new();
+  const amountKey = kind === "Debit" ? "debit" : "credit";
+  const total = rows.reduce((acc, row) => acc + amountValue(row[amountKey]), 0);
+  const summaryRows = [
+    ["Field", "Value"],
+    ["File Name", result.originalName],
+    ["Table", `${kind} Transactions`],
+    ["Rows", rows.length],
+    [`Total ${kind}`, total],
+    ["Generated", new Date().toLocaleString()],
+    [],
+    ["Date", "Description", kind, "Balance", "Confidence"],
+    ...rows.map((row) => [row.date, row.description, cleanNum(row[amountKey]), cleanNum(row.balance), row.confidence]),
+  ];
+  const sheet = XLSX.utils.aoa_to_sheet(summaryRows);
+  sheet["!cols"] = [{ wch: 14 }, { wch: 54 }, { wch: 15 }, { wch: 15 }, { wch: 12 }];
+  XLSX.utils.book_append_sheet(wb, sheet, `${kind} Transactions`);
+
+  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
+  const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${result.originalName.replace(/\.[^/.]+$/, "")}-${kind.toLowerCase()}-transactions.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function SplitTransactionTable({
+  title,
+  rows,
+  kind,
+  onExport,
+}: {
+  title: string;
+  rows: ExtractedRow[];
+  kind: "Debit" | "Credit";
+  onExport: () => void;
+}) {
+  const amountKey = kind === "Debit" ? "debit" : "credit";
+  const total = rows.reduce((acc, row) => acc + amountValue(row[amountKey]), 0);
+  const amountClass = kind === "Debit" ? "text-rose-300" : "text-emerald-300";
+  const buttonClass = kind === "Debit"
+    ? "border-rose-400/20 bg-rose-400/10 text-rose-100 hover:bg-rose-400/15"
+    : "border-emerald-400/20 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15";
+
+  return (
+    <div className="min-w-0 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02]">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-widest text-slate-400">{title}</p>
+          <p className={`mt-1 text-sm font-bold ${amountClass}`}>{money(total)} total</p>
+        </div>
+        <button
+          onClick={onExport}
+          className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${buttonClass}`}
+        >
+          <FileSpreadsheet className="size-3.5" />
+          Export
+        </button>
+      </div>
+
+      <div className="overflow-x-auto" style={{ maxHeight: 320 }}>
+        <table className="w-full min-w-[420px] border-collapse text-left text-xs">
+          <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+            <tr>
+              <th className="px-4 py-3">Date</th>
+              <th className="px-4 py-3">Description</th>
+              <th className="px-4 py-3 text-right">{kind}</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-white/5">
+            {rows.length > 0 ? rows.map((row) => (
+              <tr key={row.id} className="transition hover:bg-white/[0.03]">
+                <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
+                <td className="max-w-[220px] px-4 py-2.5 text-slate-300">
+                  <div className="line-clamp-2">{row.description}</div>
+                </td>
+                <td className={`whitespace-nowrap px-4 py-2.5 text-right tabular-nums ${amountClass}`}>{row[amountKey]}</td>
+              </tr>
+            )) : (
+              <tr>
+                <td colSpan={3} className="px-4 py-8 text-center text-xs text-slate-600">No {kind.toLowerCase()} transactions</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function ResultCard({
   result,
   index,
@@ -1076,6 +1214,15 @@ function ResultCard({
 }) {
   const s = stats(result.transactions);
   const statusColor = result.status === "done" ? "emerald" : result.status === "error" ? "rose" : result.status === "scanning" ? "cyan" : "slate";
+  const [isSplitView, setIsSplitView] = useState(false);
+  const debitRows = useMemo(
+    () => sortRowsByDate(result.transactions.filter((row) => amountValue(row.debit) > 0)),
+    [result.transactions]
+  );
+  const creditRows = useMemo(
+    () => sortRowsByDate(result.transactions.filter((row) => amountValue(row.credit) > 0)),
+    [result.transactions]
+  );
 
   return (
     <motion.div
@@ -1126,6 +1273,17 @@ function ResultCard({
         {/* Actions */}
         {result.status === "done" && (
           <div className="flex shrink-0 items-center gap-2">
+            <button onClick={() => {
+              setIsSplitView((current) => !current);
+              if (!isExpanded) onToggle();
+            }}
+              className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${
+                isSplitView
+                  ? "border-cyan-400/30 bg-cyan-400/15 text-cyan-100"
+                  : "border-white/10 bg-white/[0.06] text-slate-200 hover:bg-white/[0.1]"
+              }`}>
+              <Filter className="size-3.5" />{isSplitView ? "Full Table" : "Separate"}
+            </button>
             <button onClick={onExportPdf}
               className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.1]">
               <FileText className="size-3.5" />PDF
@@ -1193,36 +1351,53 @@ function ResultCard({
             )}
 
             {/* Transaction table */}
-            <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
-              <table className="w-full min-w-[560px] border-collapse text-left text-xs">
-                <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                  <tr>
-                    <th className="px-4 py-3">Date</th>
-                    <th className="px-4 py-3">Description</th>
-                    <th className="px-4 py-3 text-right">Debit</th>
-                    <th className="px-4 py-3 text-right">Credit</th>
-                    <th className="px-4 py-3 text-right">Balance</th>
-                    <th className="px-4 py-3">Conf.</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5">
-                  {result.transactions.map((row) => (
-                    <tr key={row.id} className="transition hover:bg-white/[0.03]">
-                      <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
-                      <td className="max-w-[200px] px-4 py-2.5 text-slate-300">
-                        <div className="line-clamp-2">{row.description}</div>
-                      </td>
-                      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
-                      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
-                      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
-                      <td className="px-4 py-2.5">
-                        <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
-                      </td>
+            {isSplitView ? (
+              <div className="grid gap-4 p-4 xl:grid-cols-2">
+                <SplitTransactionTable
+                  title="Debit Transactions"
+                  rows={debitRows}
+                  kind="Debit"
+                  onExport={() => exportSplitTable(result, "Debit", debitRows)}
+                />
+                <SplitTransactionTable
+                  title="Credit Transactions"
+                  rows={creditRows}
+                  kind="Credit"
+                  onExport={() => exportSplitTable(result, "Credit", creditRows)}
+                />
+              </div>
+            ) : (
+              <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
+                <table className="w-full min-w-[560px] border-collapse text-left text-xs">
+                  <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                    <tr>
+                      <th className="px-4 py-3">Date</th>
+                      <th className="px-4 py-3">Description</th>
+                      <th className="px-4 py-3 text-right">Debit</th>
+                      <th className="px-4 py-3 text-right">Credit</th>
+                      <th className="px-4 py-3 text-right">Balance</th>
+                      <th className="px-4 py-3">Conf.</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody className="divide-y divide-white/5">
+                    {result.transactions.map((row) => (
+                      <tr key={row.id} className="transition hover:bg-white/[0.03]">
+                        <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
+                        <td className="max-w-[200px] px-4 py-2.5 text-slate-300">
+                          <div className="line-clamp-2">{row.description}</div>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
+                        <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
+                        <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
+                        <td className="px-4 py-2.5">
+                          <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </motion.div>
         )}
       </AnimatePresence>
