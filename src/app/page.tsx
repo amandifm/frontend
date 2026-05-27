@@ -313,6 +313,7 @@ export default function Home() {
   // File batch state
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
   const [results, setResults] = useState<ScanResult[]>([]);
+  const [combinedRows, setCombinedRows] = useState<ExtractedRow[]>([]);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
   const [showCombinedTable, setShowCombinedTable] = useState(false);
@@ -374,6 +375,7 @@ export default function Home() {
     setAuthOverride(null);
     setQueuedFiles([]);
     setResults([]);
+    setCombinedRows([]);
     setHistory([]);
   }
 
@@ -430,6 +432,7 @@ export default function Home() {
     }));
     resultsRef.current = initial;
     setResults(initial);
+    setCombinedRows([]);
 
     const formData = new FormData();
     queuedFiles.forEach((f) => formData.append("files", f));
@@ -559,6 +562,7 @@ export default function Home() {
               : r
           );
           resultsRef.current = next;
+          setCombinedRows(combineResults(next));
           return next;
         });
 
@@ -571,6 +575,7 @@ export default function Home() {
               : r
           );
           resultsRef.current = next;
+          setCombinedRows(combineResults(next));
           return next;
         });
       }
@@ -703,6 +708,7 @@ export default function Home() {
     };
     resultsRef.current = [restored];
     setResults([restored]);
+    setCombinedRows(restoredRows);
     setExpandedIndex(null);
     setShowCombinedTable(true);
     if (expand) {
@@ -927,15 +933,21 @@ export default function Home() {
     ? Math.round(results.reduce((acc, r) => acc + r.progress, 0) / results.length)
     : 0;
   const totalTxns = results.reduce((acc, r) => acc + r.transactions.length, 0);
-  const allRows = combineResults(results);
-  const allStats = stats(allRows);
-  const allFilteredRows = combinedFilter === "Debit"
-    ? allRows.filter((row) => amountValue(row.debit) > 0)
-    : combinedFilter === "Credit"
-      ? allRows.filter((row) => amountValue(row.credit) > 0)
-      : allRows;
-  const allDebitCount = allRows.filter((row) => amountValue(row.debit) > 0).length;
-  const allCreditCount = allRows.filter((row) => amountValue(row.credit) > 0).length;
+  const allRows = combinedRows;
+  const allStats = useMemo(() => stats(allRows), [allRows]);
+  const allFilteredRows = useMemo(() => {
+    if (combinedFilter === "Debit") return allRows.filter((row) => amountValue(row.debit) > 0);
+    if (combinedFilter === "Credit") return allRows.filter((row) => amountValue(row.credit) > 0);
+    return allRows;
+  }, [allRows, combinedFilter]);
+  const allDebitCount = useMemo(
+    () => allRows.filter((row) => amountValue(row.debit) > 0).length,
+    [allRows]
+  );
+  const allCreditCount = useMemo(
+    () => allRows.filter((row) => amountValue(row.credit) > 0).length,
+    [allRows]
+  );
 
   // ─────────────────────────────────────────────────────────────────────────
   // AUTH GATE
@@ -959,7 +971,7 @@ export default function Home() {
                 <span className="text-slate-300">Extract transactions.</span>
               </h1>
               <p className="mt-6 max-w-xl text-base leading-7 text-slate-400">
-                Upload up to 10 bank statements at once. Our OCR engine scans them in parallel and streams each result as soon as it is ready.
+                Upload up to 10 bank statements at once. The OCR engine scans multiple documents in parallel and streams each result as soon as it is ready.
               </p>
               <div className="mt-10 grid gap-3 sm:grid-cols-2 max-w-sm">
                 <button type="button" onClick={() => setShowAuthForm(true)}
