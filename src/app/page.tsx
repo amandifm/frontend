@@ -22,6 +22,7 @@ import {
   LogOut,
   ScanLine,
   ShieldCheck,
+  TableProperties,
   Trash2,
   UploadCloud,
   UserCircle,
@@ -234,6 +235,38 @@ function sortRowsByDate(rows: ExtractedRow[]) {
     .map(({ row }) => row);
 }
 
+function transactionKey(row: ExtractedRow) {
+  return [
+    row.date.trim().toLowerCase(),
+    row.description.replace(/\s+/g, " ").trim().toLowerCase(),
+    amountValue(row.debit).toFixed(2),
+    amountValue(row.credit).toFixed(2),
+    amountValue(row.balance).toFixed(2),
+  ].join("|");
+}
+
+function rowRenderKey(row: ExtractedRow, index: number) {
+  return `${row.id}-${transactionKey(row)}-${index}`;
+}
+
+function dedupeRows(rows: ExtractedRow[]) {
+  const seen = new Set<string>();
+  const unique: ExtractedRow[] = [];
+
+  rows.forEach((row) => {
+    const key = transactionKey(row);
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push(row);
+  });
+
+  return unique;
+}
+
+function combineResults(results: ScanResult[]) {
+  return sortRowsByDate(dedupeRows(results.filter((result) => result.status === "done").flatMap((result) => result.transactions)));
+}
+
 function estimateExtractionSeconds(file: File) {
   const sizeMb = Math.max(file.size / 1024 / 1024, 0.1);
   const extension = file.name.split(".").pop()?.toLowerCase();
@@ -282,12 +315,19 @@ export default function Home() {
   const [results, setResults] = useState<ScanResult[]>([]);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
+  const [showCombinedTable, setShowCombinedTable] = useState(false);
+  const [combinedFilter, setCombinedFilter] = useState<TransactionFilter>("All");
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const resultsRef = useRef<ScanResult[]>([]);
 
   // History
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+
+  useEffect(() => {
+    resultsRef.current = results;
+  }, [results]);
 
   // ── Auth helpers ──────────────────────────────────────────────────────────
 
@@ -375,6 +415,7 @@ export default function Home() {
 
     setIsBatchRunning(true);
     setExpandedIndex(null);
+    setShowCombinedTable(false);
 
     // Initialize result slots
     const initial: ScanResult[] = queuedFiles.map((f, i) => ({
@@ -387,6 +428,7 @@ export default function Home() {
       transactions: [],
       metadata: {},
     }));
+    resultsRef.current = initial;
     setResults(initial);
 
     const formData = new FormData();
@@ -501,12 +543,12 @@ export default function Home() {
           // rather than leaving the card stuck in "scanning"
         }
 
-        setResults((prev) =>
-          prev.map((r, i) =>
+        setResults((prev) => {
+          const next = prev.map((r, i) =>
             i === idx
               ? {
                   ...r,
-                  status: "done",
+                  status: "done" as const,
                   progress: 100,
                   remainingSeconds: 0,
                   transactions: txns,
@@ -515,26 +557,32 @@ export default function Home() {
                   fileId: fileId || r.fileId,
                 }
               : r
-          )
-        );
+          );
+          resultsRef.current = next;
+          return next;
+        });
 
-        if (authUser) {
-          void autoSaveHistory(event.fileName as string, txns, metadata, summary);
-        }
       } else {
         // Extraction failed for this file — mark it and move on
-        setResults((prev) =>
-          prev.map((r, i) =>
+        setResults((prev) => {
+          const next = prev.map((r, i) =>
             i === idx
-              ? { ...r, status: "error", progress: 100, remainingSeconds: 0, error: (event.error as string) || "Extraction failed" }
+              ? { ...r, status: "error" as const, progress: 100, remainingSeconds: 0, error: (event.error as string) || "Extraction failed" }
               : r
-          )
-        );
+          );
+          resultsRef.current = next;
+          return next;
+        });
       }
       return;
     }
 
     if (event.event === "batch_complete") {
+      const combinedRows = combineResults(resultsRef.current);
+      setShowCombinedTable(combinedRows.length > 0);
+      if (combinedRows.length > 0 && authUser) {
+        void autoSaveCombinedHistory(resultsRef.current, combinedRows);
+      }
       // Server confirmed all files processed — nothing extra needed here
       // (isBatchRunning is cleared in the finally block)
     }
@@ -565,14 +613,24 @@ export default function Home() {
     try {
       if (user.isGuest) {
         const s = window.localStorage.getItem(`difm_history_${user.id}`);
-        setHistory(s ? JSON.parse(s) : []);
+        const items = s ? JSON.parse(s) as HistoryItem[] : [];
+        setHistory(items);
+        const latestCombined = items.find((item) => item.summary?.kind === "combined_transactions") || items[0];
+        if (latestCombined && resultsRef.current.length === 0) {
+          restoreHistoryItem(latestCombined, false);
+        }
         return;
       }
       const token = window.localStorage.getItem("difm_token");
       const res = await fetch(`${apiBase}/api/history`, { headers: { Authorization: `Bearer ${token}` } });
       const p = await res.json();
       if (!res.ok || !p.success) throw new Error(p.message);
-      setHistory(p.data);
+      const items = p.data as HistoryItem[];
+      setHistory(items);
+      const latestCombined = items.find((item) => item.summary?.kind === "combined_transactions") || items[0];
+      if (latestCombined && resultsRef.current.length === 0) {
+        restoreHistoryItem(latestCombined, false);
+      }
     } catch {
       setHistory([]);
     } finally {
@@ -580,19 +638,29 @@ export default function Home() {
     }
   }
 
-  async function autoSaveHistory(fileName: string, transactions: ExtractedRow[], metadata: DocumentMetadata, summary: unknown) {
+  async function autoSaveCombinedHistory(batchResults: ScanResult[], combinedRows: ExtractedRow[]) {
     if (!authUser) return;
-    const item = { fileName, transactions, metadata, summary };
+
+    const sourceFiles = batchResults.filter((result) => result.status === "done").map((result) => result.originalName);
+    const metadata: DocumentMetadata = batchResults.find((result) => result.status === "done")?.metadata || {};
+    const summary = {
+      kind: "combined_transactions",
+      source_files: sourceFiles,
+      source_file_count: sourceFiles.length,
+      duplicate_removed_count: batchResults.filter((result) => result.status === "done").flatMap((result) => result.transactions).length - combinedRows.length,
+    };
+    const fileName = sourceFiles.length > 1 ? "All Extracted Transactions" : sourceFiles[0] || "Extracted Transactions";
+    const item = { fileName, transactions: combinedRows, metadata, summary };
 
     if (authUser.isGuest) {
       const localItem: HistoryItem = {
         id: `local-${Date.now()}`,
         fileName,
-        transactionCount: transactions.length,
-        averageConfidence: "96%",
-        transactions,
+        transactionCount: combinedRows.length,
+        averageConfidence: null,
+        transactions: combinedRows,
         metadata,
-        summary: summary as Record<string, unknown>,
+        summary,
         createdAt: new Date().toISOString(),
         isLocal: true,
       };
@@ -617,6 +685,28 @@ export default function Home() {
       }
     } catch {
       // silent
+    }
+  }
+
+  function restoreHistoryItem(item: HistoryItem, expand = true) {
+    const restoredRows = sortRowsByDate(dedupeRows((item.transactions || []).map((row, index) => ({ ...row, id: row.id || `history-${index}` }))));
+    const restored: ScanResult = {
+      fileId: item.id,
+      originalName: item.fileName,
+      status: "done",
+      progress: 100,
+      estimatedSeconds: 0,
+      remainingSeconds: 0,
+      transactions: restoredRows,
+      metadata: item.metadata || {},
+      summary: item.summary,
+    };
+    resultsRef.current = [restored];
+    setResults([restored]);
+    setExpandedIndex(null);
+    setShowCombinedTable(true);
+    if (expand) {
+      window.setTimeout(() => document.getElementById("all-transactions-table")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
     }
   }
 
@@ -690,6 +780,11 @@ export default function Home() {
     const done = results.filter((r) => r.status === "done");
     if (done.length === 0) return;
     const wb = XLSX.utils.book_new();
+    const combinedHeaders = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
+    const combinedRows = combineResults(done).map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, r.confidence]);
+    const combinedSheet = XLSX.utils.aoa_to_sheet([combinedHeaders, ...combinedRows]);
+    combinedSheet["!cols"] = [{ wch: 14 }, { wch: 55 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 12 }];
+    XLSX.utils.book_append_sheet(wb, combinedSheet, "All Transactions");
     done.forEach((result) => {
       const s = stats(result.transactions);
       const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
@@ -832,7 +927,15 @@ export default function Home() {
     ? Math.round(results.reduce((acc, r) => acc + r.progress, 0) / results.length)
     : 0;
   const totalTxns = results.reduce((acc, r) => acc + r.transactions.length, 0);
-  const allStats = stats(results.flatMap((r) => r.transactions));
+  const allRows = combineResults(results);
+  const allStats = stats(allRows);
+  const allFilteredRows = combinedFilter === "Debit"
+    ? allRows.filter((row) => amountValue(row.debit) > 0)
+    : combinedFilter === "Credit"
+      ? allRows.filter((row) => amountValue(row.credit) > 0)
+      : allRows;
+  const allDebitCount = allRows.filter((row) => amountValue(row.debit) > 0).length;
+  const allCreditCount = allRows.filter((row) => amountValue(row.credit) > 0).length;
 
   // ─────────────────────────────────────────────────────────────────────────
   // AUTH GATE
@@ -1078,11 +1181,24 @@ export default function Home() {
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
                 className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
                 <p className="mb-3 text-xs font-bold uppercase tracking-widest text-slate-400">Export All Results</p>
-                <button onClick={exportAllXlsx}
-                  className="flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 py-2.5 text-sm font-bold text-white shadow-lg shadow-emerald-500/20 transition hover:bg-emerald-400">
-                  <ArrowDownToLine className="size-4" />
-                  Download All as XLSX
-                </button>
+                <div className="grid grid-cols-[1fr_auto] gap-2">
+                  <button onClick={exportAllXlsx}
+                    className="flex items-center justify-center gap-2 rounded-lg bg-emerald-500 py-2.5 text-sm font-bold text-white shadow-lg shadow-emerald-500/20 transition hover:bg-emerald-400">
+                    <ArrowDownToLine className="size-4" />
+                    Download All as XLSX
+                  </button>
+                  <button
+                    onClick={() => setShowCombinedTable((current) => !current)}
+                    title="Show full table"
+                    className={`flex size-11 items-center justify-center rounded-lg border text-slate-100 transition ${
+                      showCombinedTable
+                        ? "border-cyan-400/30 bg-cyan-400/15"
+                        : "border-white/10 bg-white/[0.06] hover:bg-white/[0.1]"
+                    }`}
+                  >
+                    <TableProperties className="size-4" />
+                  </button>
+                </div>
               </motion.div>
             )}
 
@@ -1115,6 +1231,13 @@ export default function Home() {
                           className="shrink-0 text-slate-600 transition hover:text-rose-400">
                           <Trash2 className="size-3.5" />
                         </button>
+                        <button
+                          onClick={() => restoreHistoryItem(item)}
+                          title="Show full table"
+                          className="shrink-0 text-slate-600 transition hover:text-cyan-300"
+                        >
+                          <TableProperties className="size-3.5" />
+                        </button>
                       </li>
                     ))}
                   </ul>
@@ -1143,6 +1266,91 @@ export default function Home() {
                 <ScanLine className="mb-4 size-10 text-cyan-800" />
                 <p className="text-sm font-semibold text-slate-400">{queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""} ready</p>
                 <p className="mt-1 text-xs text-slate-600">Estimated scan time: {formatDuration(queuedEstimateSeconds)}</p>
+              </motion.div>
+            )}
+
+            {showCombinedTable && allRows.length > 0 && (
+              <motion.div
+                id="all-transactions-table"
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="overflow-hidden rounded-2xl border border-cyan-400/20 bg-white/[0.035] shadow-lg"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <TableProperties className="size-4 text-cyan-300" />
+                      <p className="text-sm font-bold text-white">All Extracted Transactions</p>
+                    </div>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {allRows.length} unique rows sorted by date
+                    </p>
+                  </div>
+                  <div className="flex rounded-lg border border-white/10 bg-white/[0.04] p-1">
+                    {[
+                      { label: "All" as const, count: allRows.length },
+                      { label: "Debit" as const, count: allDebitCount },
+                      { label: "Credit" as const, count: allCreditCount },
+                    ].map(({ label, count }) => (
+                      <button
+                        key={label}
+                        onClick={() => setCombinedFilter(label)}
+                        className={`min-w-16 rounded-md px-3 py-1.5 text-xs font-bold transition ${
+                          combinedFilter === label
+                            ? "bg-cyan-400 text-slate-950"
+                            : "text-slate-400 hover:bg-white/[0.07] hover:text-white"
+                        }`}
+                      >
+                        {label} <span className="font-semibold opacity-70">{count}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-4 md:divide-y-0">
+                  {[
+                    { label: "Rows", value: allFilteredRows.length, className: "text-white" },
+                    { label: "Total Debit", value: money(allStats.totalDebit), className: "text-rose-300" },
+                    { label: "Total Credit", value: money(allStats.totalCredit), className: "text-emerald-300" },
+                    { label: "Duplicates Removed", value: Math.max(0, totalTxns - allRows.length), className: "text-cyan-200" },
+                  ].map(({ label, value, className }) => (
+                    <div key={label} className="px-4 py-3 text-center">
+                      <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">{label}</p>
+                      <p className={`mt-1 text-base font-bold ${className}`}>{value}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="overflow-x-auto" style={{ maxHeight: 520 }}>
+                  <table className="w-full min-w-[640px] border-collapse text-left text-xs">
+                    <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                      <tr>
+                        <th className="px-4 py-3">Date</th>
+                        <th className="px-4 py-3">Description</th>
+                        <th className="px-4 py-3 text-right">Debit</th>
+                        <th className="px-4 py-3 text-right">Credit</th>
+                        <th className="px-4 py-3 text-right">Balance</th>
+                        <th className="px-4 py-3">Accuracy</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {allFilteredRows.map((row, rowIndex) => (
+                        <tr key={rowRenderKey(row, rowIndex)} className="transition hover:bg-white/[0.03]">
+                          <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
+                          <td className="max-w-[260px] px-4 py-2.5 text-slate-300" title={row.description}>
+                            <div className="line-clamp-2">{row.description}</div>
+                          </td>
+                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
+                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
+                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
+                          <td className="px-4 py-2.5">
+                            <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </motion.div>
             )}
 
@@ -1326,10 +1534,10 @@ function SplitTransactionTable({
             </tr>
           </thead>
           <tbody className="divide-y divide-white/5">
-            {rows.length > 0 ? rows.map((row) => (
-              <tr key={row.id} className="transition hover:bg-white/[0.03]">
+            {rows.length > 0 ? rows.map((row, rowIndex) => (
+              <tr key={rowRenderKey(row, rowIndex)} className="transition hover:bg-white/[0.03]">
                 <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
-                <td className="max-w-[220px] px-4 py-2.5 text-slate-300">
+                <td className="max-w-[220px] px-4 py-2.5 text-slate-300" title={row.description}>
                   <div className="line-clamp-2">{row.description}</div>
                 </td>
                 <td className={`whitespace-nowrap px-4 py-2.5 text-right tabular-nums ${amountClass}`}>{row[amountKey]}</td>
@@ -1580,10 +1788,10 @@ function ResultCard({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
-                      {visibleRows.length > 0 ? visibleRows.map((row) => (
-                        <tr key={row.id} className="transition hover:bg-white/[0.03]">
+                      {visibleRows.length > 0 ? visibleRows.map((row, rowIndex) => (
+                        <tr key={rowRenderKey(row, rowIndex)} className="transition hover:bg-white/[0.03]">
                           <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
-                          <td className="max-w-[200px] px-4 py-2.5 text-slate-300">
+                          <td className="max-w-[200px] px-4 py-2.5 text-slate-300" title={row.description}>
                             <div className="line-clamp-2">{row.description}</div>
                           </td>
                           <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
