@@ -1129,16 +1129,79 @@ function exportSplitTable(result: ScanResult, kind: "Debit" | "Credit", rows: Ex
   URL.revokeObjectURL(url);
 }
 
+function exportSplitPdf(
+  result: ScanResult,
+  kind: "Debit" | "Credit",
+  rows: ExtractedRow[]
+) {
+  const doc = new jsPDF({
+    orientation: "landscape",
+    unit: "pt",
+    format: "a4",
+  });
+
+  const amountKey = kind === "Debit" ? "debit" : "credit";
+
+  const total = rows.reduce(
+    (acc, row) => acc + amountValue(row[amountKey]),
+    0
+  );
+
+  doc.setFontSize(18);
+  doc.text(`${kind} Transactions Report`, 40, 40);
+
+  doc.setFontSize(10);
+  doc.text(`File: ${result.originalName}`, 40, 65);
+  doc.text(`Rows: ${rows.length}`, 40, 82);
+  doc.text(`Total ${kind}: ${money(total)}`, 40, 99);
+  doc.text(
+    `Generated: ${new Date().toLocaleString()}`,
+    40,
+    116
+  );
+
+  autoTable(doc, {
+    startY: 140,
+    head: [["Date", "Description", kind, "Balance", "Confidence"]],
+    body: rows.map((row) => [
+      row.date,
+      row.description,
+      row[amountKey],
+      row.balance,
+      row.confidence,
+    ]),
+    styles: {
+      fontSize: 8,
+      overflow: "linebreak",
+    },
+    headStyles: {
+      fillColor: [8,126,190],
+    },
+    columnStyles: {
+      1: { cellWidth: 280 },
+    },
+  });
+
+  doc.save(
+    `${result.originalName.replace(
+      /\.[^/.]+$/,
+      ""
+    )}-${kind.toLowerCase()}-transactions.pdf`
+  );
+}
+
 function SplitTransactionTable({
   title,
   rows,
   kind,
   onExport,
+  onPdfExport,
 }: {
   title: string;
   rows: ExtractedRow[];
   kind: "Debit" | "Credit";
   onExport: () => void;
+  onPdfExport: () => void;
 }) {
   const amountKey = kind === "Debit" ? "debit" : "credit";
   const total = rows.reduce((acc, row) => acc + amountValue(row[amountKey]), 0);
@@ -1154,13 +1217,23 @@ function SplitTransactionTable({
           <p className="text-xs font-bold uppercase tracking-widest text-slate-400">{title}</p>
           <p className={`mt-1 text-sm font-bold ${amountClass}`}>{money(total)} total</p>
         </div>
-        <button
-          onClick={onExport}
-          className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${buttonClass}`}
-        >
-          <FileSpreadsheet className="size-3.5" />
-          Export
-        </button>
+<div className="flex items-center gap-2">
+  <button
+    onClick={onPdfExport}
+    className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 py-1.5 text-xs font-semibold text-slate-200 hover:bg-white/[0.1]"
+  >
+    <FileText className="size-3.5" />
+    PDF
+  </button>
+
+  <button
+    onClick={onExport}
+    className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${buttonClass}`}
+  >
+    <FileSpreadsheet className="size-3.5" />
+    XLSX
+  </button>
+</div>
       </div>
 
       <div className="overflow-x-auto" style={{ maxHeight: 320 }}>
@@ -1353,18 +1426,24 @@ function ResultCard({
             {/* Transaction table */}
             {isSplitView ? (
               <div className="grid gap-4 p-4 xl:grid-cols-2">
-                <SplitTransactionTable
-                  title="Debit Transactions"
-                  rows={debitRows}
-                  kind="Debit"
-                  onExport={() => exportSplitTable(result, "Debit", debitRows)}
-                />
-                <SplitTransactionTable
-                  title="Credit Transactions"
-                  rows={creditRows}
-                  kind="Credit"
-                  onExport={() => exportSplitTable(result, "Credit", creditRows)}
-                />
+<SplitTransactionTable
+  title="Debit Transactions"
+  rows={debitRows}
+  kind="Debit"
+  onExport={() => exportSplitTable(result, "Debit", debitRows)}
+  onPdfExport={() =>
+    exportSplitPdf(result, "Debit", debitRows)
+  }
+/>
+<SplitTransactionTable
+  title="Credit Transactions"
+  rows={creditRows}
+  kind="Credit"
+  onExport={() => exportSplitTable(result, "Credit", creditRows)}
+  onPdfExport={() =>
+    exportSplitPdf(result, "Credit", creditRows)
+  }
+/>
               </div>
             ) : (
               <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
