@@ -51,6 +51,10 @@ type ExtractedRow = {
   type: "Debit" | "Credit";
   confidence: string;
   section?: string;
+  isRevenue?: boolean | null;
+  revenueStatus?: "Revenue" | "Deduction" | null;
+  revenueExclusionCategory?: string | null;
+  revenueExclusionReason?: string | null;
 };
 
 type DocumentMetadata = {
@@ -78,6 +82,7 @@ type ScanResult = {
   transactions: ExtractedRow[];
   metadata: DocumentMetadata;
   summary?: Record<string, unknown>;
+  revenueAnalysis?: Record<string, unknown>;
 };
 
 type HistoryItem = {
@@ -130,6 +135,10 @@ function mapRow(row: Record<string, unknown>, idx: number): ExtractedRow {
     type,
     confidence: fmtConf(row.confidence as number),
     section: (row.section as string) || (type === "Credit" ? "Credits / Deposits" : "Debits / Withdrawals"),
+    isRevenue: typeof row.is_revenue === "boolean" ? row.is_revenue : null,
+    revenueStatus: (row.revenue_status as "Revenue" | "Deduction" | null) || null,
+    revenueExclusionCategory: (row.revenue_exclusion_category as string | null) || null,
+    revenueExclusionReason: (row.revenue_exclusion_reason as string | null) || null,
   };
 }
 
@@ -142,6 +151,33 @@ function stats(rows: ExtractedRow[]) {
     if (c > 0) { tc += c; nc++; }
   });
   return { totalDebit: td, totalCredit: tc, countDebit: nd, countCredit: nc };
+}
+
+function revenueStats(rows: ExtractedRow[]) {
+  let rawCredits = 0;
+  let adjustedRevenue = 0;
+  let creditDeductions = 0;
+
+  rows.forEach((row) => {
+    const credit = amountValue(row.credit);
+    if (credit <= 0) return;
+    rawCredits += credit;
+    if (row.revenueStatus === "Deduction") {
+      creditDeductions += credit;
+    } else {
+      adjustedRevenue += credit;
+    }
+  });
+
+  return { rawCredits, adjustedRevenue, creditDeductions };
+}
+
+function revenueLabel(row: ExtractedRow) {
+  if (amountValue(row.credit) <= 0) return "-";
+  if (row.revenueStatus === "Deduction") {
+    return row.revenueExclusionCategory || "Deduction";
+  }
+  return "Revenue";
 }
 
 function cleanNum(v: string) {
@@ -531,6 +567,7 @@ export default function Home() {
         let txns: ExtractedRow[] = [];
         let metadata: DocumentMetadata = {};
         let summary: Record<string, unknown> | undefined;
+        let revenueAnalysis: Record<string, unknown> | undefined;
         let fileId: string | undefined;
 
         try {
@@ -540,6 +577,7 @@ export default function Home() {
             : [];
           metadata = (data.metadata as DocumentMetadata) || {};
           summary = data.summary as Record<string, unknown>;
+          revenueAnalysis = data.revenueAnalysis as Record<string, unknown>;
           fileId = data.fileId as string | undefined;
         } catch {
           // Payload parse failed — treat as successful scan with 0 transactions
@@ -557,6 +595,7 @@ export default function Home() {
                   transactions: txns,
                   metadata,
                   summary,
+                  revenueAnalysis,
                   fileId: fileId || r.fileId,
                 }
               : r
@@ -705,6 +744,7 @@ export default function Home() {
       transactions: restoredRows,
       metadata: item.metadata || {},
       summary: item.summary,
+      revenueAnalysis: item.summary?.revenue_analysis as Record<string, unknown> | undefined,
     };
     resultsRef.current = [restored];
     setResults([restored]);
@@ -764,10 +804,10 @@ export default function Home() {
     metaSheet["!cols"] = [{ wch: 30 }, { wch: 45 }];
     XLSX.utils.book_append_sheet(wb, metaSheet, "Document Info");
 
-    const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
-    const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, r.confidence]);
+    const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue Status", "Revenue Filter Reason", "Confidence"];
+    const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, revenueLabel(r), r.revenueExclusionReason || "", r.confidence]);
     const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
-    sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 10 }, { wch: 12 }];
+    sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 10 }, { wch: 22 }, { wch: 45 }, { wch: 12 }];
     XLSX.utils.book_append_sheet(wb, sheet, "Transactions");
 
     const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
@@ -786,15 +826,15 @@ export default function Home() {
     const done = results.filter((r) => r.status === "done");
     if (done.length === 0) return;
     const wb = XLSX.utils.book_new();
-    const combinedHeaders = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
-    const combinedRows = combineResults(done).map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, r.confidence]);
+    const combinedHeaders = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue Status", "Revenue Filter Reason", "Confidence"];
+    const combinedRows = combineResults(done).map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, revenueLabel(r), r.revenueExclusionReason || "", r.confidence]);
     const combinedSheet = XLSX.utils.aoa_to_sheet([combinedHeaders, ...combinedRows]);
-    combinedSheet["!cols"] = [{ wch: 14 }, { wch: 55 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 12 }];
+    combinedSheet["!cols"] = [{ wch: 14 }, { wch: 55 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 22 }, { wch: 45 }, { wch: 12 }];
     XLSX.utils.book_append_sheet(wb, combinedSheet, "All Transactions");
     done.forEach((result) => {
       const s = stats(result.transactions);
-      const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
-      const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, r.confidence]);
+      const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue Status", "Revenue Filter Reason", "Confidence"];
+      const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, revenueLabel(r), r.revenueExclusionReason || "", r.confidence]);
       const infoRows = [
         ["Account Holder", result.metadata.account_holder || "-"],
         ["Account Number", result.metadata.account_number || "-"],
@@ -806,7 +846,7 @@ export default function Home() {
         [],
       ];
       const sheet = XLSX.utils.aoa_to_sheet([...infoRows, headers, ...rows]);
-      sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 12 }];
+      sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 22 }, { wch: 45 }, { wch: 12 }];
       const sheetName = result.originalName.replace(/\.[^/.]+$/, "").slice(0, 30);
       XLSX.utils.book_append_sheet(wb, sheet, sheetName);
     });
@@ -884,8 +924,8 @@ export default function Home() {
     autoTable(doc, {
       startY: summaryTop + 72,
       margin: { top: 36, left: margin, right: margin, bottom: 42 },
-      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"]],
-      body: result.transactions.map((r) => [r.date, r.description, r.debit, r.credit, r.balance, r.type, r.confidence]),
+      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue", "Confidence"]],
+      body: result.transactions.map((r) => [r.date, r.description, r.debit, r.credit, r.balance, r.type, revenueLabel(r), r.confidence]),
       tableWidth: pageWidth - margin * 2,
       styles: {
         font: "helvetica",
@@ -907,12 +947,13 @@ export default function Home() {
       alternateRowStyles: { fillColor: [248, 250, 252] },
       columnStyles: {
         0: { cellWidth: 72 },
-        1: { cellWidth: 270 },
-        2: { cellWidth: 78, halign: "right", textColor: [190, 18, 60] },
-        3: { cellWidth: 78, halign: "right", textColor: [4, 120, 87] },
-        4: { cellWidth: 82, halign: "right" },
-        5: { cellWidth: 62, halign: "center" },
-        6: { cellWidth: 72, halign: "center" },
+        1: { cellWidth: 230 },
+        2: { cellWidth: 70, halign: "right", textColor: [190, 18, 60] },
+        3: { cellWidth: 70, halign: "right", textColor: [4, 120, 87] },
+        4: { cellWidth: 76, halign: "right" },
+        5: { cellWidth: 56, halign: "center" },
+        6: { cellWidth: 90, halign: "center" },
+        7: { cellWidth: 68, halign: "center" },
       },
       didDrawPage: (data) => {
         doc.setFont("helvetica", "normal");
@@ -935,6 +976,7 @@ export default function Home() {
   const totalTxns = results.reduce((acc, r) => acc + r.transactions.length, 0);
   const allRows = combinedRows;
   const allStats = useMemo(() => stats(allRows), [allRows]);
+  const allRevenueStats = useMemo(() => revenueStats(allRows), [allRows]);
   const allFilteredRows = useMemo(() => {
     if (combinedFilter === "Debit") return allRows.filter((row) => amountValue(row.debit) > 0);
     if (combinedFilter === "Credit") return allRows.filter((row) => amountValue(row.credit) > 0);
@@ -1093,9 +1135,9 @@ export default function Home() {
             {[
               { label: "Files Scanned", value: `${completedCount} / ${results.length}`, border: "border-cyan-400/15", text: "text-cyan-200" },
               { label: "Total Transactions", value: totalTxns, border: "border-emerald-400/15", text: "text-emerald-200" },
-              { label: "Total Credit", value: money(allStats.totalCredit), border: "border-emerald-400/15", text: "text-emerald-300" },
+              { label: "Raw Credits", value: money(allRevenueStats.rawCredits), border: "border-emerald-400/15", text: "text-emerald-300" },
+              { label: "Adjusted Revenue", value: money(allRevenueStats.adjustedRevenue), border: "border-cyan-400/15", text: "text-cyan-200" },
               { label: "Total Debit", value: money(allStats.totalDebit), border: "border-rose-400/15", text: "text-rose-300" },
-              { label: "Errors", value: errorCount, border: errorCount > 0 ? "border-rose-400/15" : "border-slate-400/15", text: errorCount > 0 ? "text-rose-200" : "text-slate-200" },
               { label: "Scan Status", value: `${scanPercent}%`, border: "border-amber-400/15", text: "text-amber-200" },
             ].map(({ label, value, border, text }) => (
               <div key={label} className={`rounded-xl border bg-white/[0.04] p-3 ${border}`}>
@@ -1321,10 +1363,10 @@ export default function Home() {
 
                 <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-4 md:divide-y-0">
                   {[
-                    { label: "Rows", value: allFilteredRows.length, className: "text-white" },
-                    { label: "Total Debit", value: money(allStats.totalDebit), className: "text-rose-300" },
-                    { label: "Total Credit", value: money(allStats.totalCredit), className: "text-emerald-300" },
-                    { label: "Duplicates Removed", value: Math.max(0, totalTxns - allRows.length), className: "text-cyan-200" },
+                    { label: "Raw Credits", value: money(allRevenueStats.rawCredits), className: "text-emerald-300" },
+                    { label: "Adjusted Revenue", value: money(allRevenueStats.adjustedRevenue), className: "text-cyan-200" },
+                    { label: "Credit Deductions", value: money(allRevenueStats.creditDeductions), className: "text-amber-200" },
+                    { label: "Total Debits", value: money(allStats.totalDebit), className: "text-rose-300" },
                   ].map(({ label, value, className }) => (
                     <div key={label} className="px-4 py-3 text-center">
                       <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">{label}</p>
@@ -1334,7 +1376,7 @@ export default function Home() {
                 </div>
 
                 <div className="overflow-x-auto" style={{ maxHeight: 520 }}>
-                  <table className="w-full min-w-[640px] border-collapse text-left text-xs">
+                  <table className="w-full min-w-[780px] border-collapse text-left text-xs">
                     <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
                       <tr>
                         <th className="px-4 py-3">Date</th>
@@ -1342,6 +1384,7 @@ export default function Home() {
                         <th className="px-4 py-3 text-right">Debit</th>
                         <th className="px-4 py-3 text-right">Credit</th>
                         <th className="px-4 py-3 text-right">Balance</th>
+                        <th className="px-4 py-3">Revenue</th>
                         <th className="px-4 py-3">Accuracy</th>
                       </tr>
                     </thead>
@@ -1355,6 +1398,17 @@ export default function Home() {
                           <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
                           <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
                           <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
+                          <td className="max-w-[180px] px-4 py-2.5 text-slate-300" title={row.revenueExclusionReason || revenueLabel(row)}>
+                            <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                              row.revenueStatus === "Deduction"
+                                ? "bg-amber-400/10 text-amber-200"
+                                : amountValue(row.credit) > 0
+                                  ? "bg-emerald-400/10 text-emerald-300"
+                                  : "bg-white/[0.04] text-slate-500"
+                            }`}>
+                              {revenueLabel(row)}
+                            </span>
+                          </td>
                           <td className="px-4 py-2.5">
                             <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
                           </td>
@@ -1394,6 +1448,12 @@ function exportSplitTable(result: ScanResult, kind: "Debit" | "Credit", rows: Ex
   const wb = XLSX.utils.book_new();
   const amountKey = kind === "Debit" ? "debit" : "credit";
   const total = rows.reduce((acc, row) => acc + amountValue(row[amountKey]), 0);
+  const tableHeaders = kind === "Credit"
+    ? ["Date", "Description", kind, "Balance", "Revenue Status", "Revenue Filter Reason", "Confidence"]
+    : ["Date", "Description", kind, "Balance", "Confidence"];
+  const tableRows = kind === "Credit"
+    ? rows.map((row) => [row.date, row.description, cleanNum(row[amountKey]), cleanNum(row.balance), revenueLabel(row), row.revenueExclusionReason || "", row.confidence])
+    : rows.map((row) => [row.date, row.description, cleanNum(row[amountKey]), cleanNum(row.balance), row.confidence]);
   const summaryRows = [
     ["Field", "Value"],
     ["File Name", result.originalName],
@@ -1406,11 +1466,13 @@ function exportSplitTable(result: ScanResult, kind: "Debit" | "Credit", rows: Ex
     [`Total ${kind}`, total],
     ["Generated", new Date().toLocaleString()],
     [],
-    ["Date", "Description", kind, "Balance", "Confidence"],
-    ...rows.map((row) => [row.date, row.description, cleanNum(row[amountKey]), cleanNum(row.balance), row.confidence]),
+    tableHeaders,
+    ...tableRows,
   ];
   const sheet = XLSX.utils.aoa_to_sheet(summaryRows);
-  sheet["!cols"] = [{ wch: 14 }, { wch: 54 }, { wch: 15 }, { wch: 15 }, { wch: 12 }];
+  sheet["!cols"] = kind === "Credit"
+    ? [{ wch: 14 }, { wch: 54 }, { wch: 15 }, { wch: 15 }, { wch: 22 }, { wch: 45 }, { wch: 12 }]
+    : [{ wch: 14 }, { wch: 54 }, { wch: 15 }, { wch: 15 }, { wch: 12 }];
   XLSX.utils.book_append_sheet(wb, sheet, `${kind} Transactions`);
 
   const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
@@ -1537,12 +1599,13 @@ function SplitTransactionTable({
       </div>
 
       <div className="overflow-x-auto" style={{ maxHeight: 320 }}>
-        <table className="w-full min-w-[420px] border-collapse text-left text-xs">
+        <table className="w-full min-w-[520px] border-collapse text-left text-xs">
           <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
             <tr>
               <th className="px-4 py-3">Date</th>
               <th className="px-4 py-3">Description</th>
               <th className="px-4 py-3 text-right">{kind}</th>
+              {kind === "Credit" && <th className="px-4 py-3">Revenue</th>}
             </tr>
           </thead>
           <tbody className="divide-y divide-white/5">
@@ -1553,10 +1616,21 @@ function SplitTransactionTable({
                   <div className="line-clamp-2">{row.description}</div>
                 </td>
                 <td className={`whitespace-nowrap px-4 py-2.5 text-right tabular-nums ${amountClass}`}>{row[amountKey]}</td>
+                {kind === "Credit" && (
+                  <td className="max-w-[160px] px-4 py-2.5 text-slate-300" title={row.revenueExclusionReason || revenueLabel(row)}>
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                      row.revenueStatus === "Deduction"
+                        ? "bg-amber-400/10 text-amber-200"
+                        : "bg-emerald-400/10 text-emerald-300"
+                    }`}>
+                      {revenueLabel(row)}
+                    </span>
+                  </td>
+                )}
               </tr>
             )) : (
               <tr>
-                <td colSpan={3} className="px-4 py-8 text-center text-xs text-slate-600">No {kind.toLowerCase()} transactions</td>
+                <td colSpan={kind === "Credit" ? 4 : 3} className="px-4 py-8 text-center text-xs text-slate-600">No {kind.toLowerCase()} transactions</td>
               </tr>
             )}
           </tbody>
@@ -1586,6 +1660,7 @@ function ResultCard({
   onExportPdf: () => void;
 }) {
   const s = stats(result.transactions);
+  const revenue = revenueStats(result.transactions);
   const accountDetails = [
     { label: "Holder", value: displayValue(result.metadata.account_holder) },
     { label: "Account Number", value: displayValue(result.metadata.account_number) },
@@ -1711,10 +1786,10 @@ function ResultCard({
             {/* Stats strip */}
             <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-4 md:divide-y-0">
               {[
-                { label: "Transactions", value: result.transactions.length, className: "text-white" },
-                { label: "Total Debit", value: `$${s.totalDebit.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, className: "text-rose-300" },
-                { label: "Total Credit", value: `$${s.totalCredit.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, className: "text-emerald-300" },
-                { label: "Remaining Balance", value: remainingBalance(result), className: "text-cyan-200" },
+                { label: "Raw Credits", value: money(revenue.rawCredits), className: "text-emerald-300" },
+                { label: "Adjusted Revenue", value: money(revenue.adjustedRevenue), className: "text-cyan-200" },
+                { label: "Credit Deductions", value: money(revenue.creditDeductions), className: "text-amber-200" },
+                { label: "Total Debits", value: money(s.totalDebit), className: "text-rose-300" },
               ].map(({ label, value, className }) => (
                 <div key={label} className="px-4 py-3 text-center">
                   <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">{label}</p>
@@ -1788,7 +1863,7 @@ function ResultCard({
                 </div>
 
                 <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
-                  <table className="w-full min-w-[560px] border-collapse text-left text-xs">
+                  <table className="w-full min-w-[760px] border-collapse text-left text-xs">
                     <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
                       <tr>
                         <th className="px-4 py-3">Date</th>
@@ -1796,6 +1871,7 @@ function ResultCard({
                         <th className="px-4 py-3 text-right">Debit</th>
                         <th className="px-4 py-3 text-right">Credit</th>
                         <th className="px-4 py-3 text-right">Balance</th>
+                        <th className="px-4 py-3">Revenue</th>
                         <th className="px-4 py-3">Accuracy</th>
                       </tr>
                     </thead>
@@ -1809,13 +1885,24 @@ function ResultCard({
                           <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
                           <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
                           <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
+                          <td className="max-w-[180px] px-4 py-2.5 text-slate-300" title={row.revenueExclusionReason || revenueLabel(row)}>
+                            <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                              row.revenueStatus === "Deduction"
+                                ? "bg-amber-400/10 text-amber-200"
+                                : amountValue(row.credit) > 0
+                                  ? "bg-emerald-400/10 text-emerald-300"
+                                  : "bg-white/[0.04] text-slate-500"
+                            }`}>
+                              {revenueLabel(row)}
+                            </span>
+                          </td>
                           <td className="px-4 py-2.5">
                             <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
                           </td>
                         </tr>
                       )) : (
                         <tr>
-                          <td colSpan={6} className="px-4 py-8 text-center text-xs text-slate-600">
+                          <td colSpan={7} className="px-4 py-8 text-center text-xs text-slate-600">
                             No {transactionFilter.toLowerCase()} transactions
                           </td>
                         </tr>
