@@ -38,6 +38,7 @@ type AuthUser = { id: string; name: string; email: string; role?: string; isGues
 type AuthForm = { name: string; email: string; password: string };
 
 type FileStatus = "queued" | "scanning" | "done" | "error";
+type TransactionFilter = "All" | "Debit" | "Credit";
 
 type ExtractedRow = {
   id: string;
@@ -58,6 +59,11 @@ type DocumentMetadata = {
   statement_period_start?: string;
   statement_period_end?: string;
   statement_date?: string;
+  beginning_balance?: string;
+  ending_balance?: string;
+  closing_balance?: string;
+  current_balance?: string;
+  available_balance?: string;
 };
 
 type ScanResult = {
@@ -79,6 +85,7 @@ type HistoryItem = {
   transactionCount: number;
   averageConfidence?: string | number | null;
   transactions: ExtractedRow[];
+  metadata?: DocumentMetadata;
   summary?: Record<string, unknown>;
   createdAt: string;
   isLocal?: boolean;
@@ -149,6 +156,52 @@ function money(value: number) {
 function amountValue(value: string) {
   if (!value || value === "-") return 0;
   return parseFloat(value.replace(/[$,\s]/g, "")) || 0;
+}
+
+function displayValue(value: string | null | undefined) {
+  const cleaned = String(value ?? "").trim();
+  return cleaned && cleaned !== "-" ? cleaned : "-";
+}
+
+function moneyLike(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "number") return money(value);
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "-") return "-";
+  const numeric = Number(trimmed.replace(/[$,\s]/g, ""));
+  if (!Number.isFinite(numeric)) return trimmed;
+  return money(numeric);
+}
+
+function firstSummaryValue(summary: Record<string, unknown> | undefined, keys: string[]) {
+  if (!summary) return undefined;
+  for (const key of keys) {
+    const value = summary[key];
+    if (typeof value === "string" || typeof value === "number") return value;
+  }
+  return undefined;
+}
+
+function remainingBalance(result: ScanResult) {
+  const extractedBalance =
+    result.metadata.ending_balance ||
+    result.metadata.closing_balance ||
+    result.metadata.current_balance ||
+    result.metadata.available_balance ||
+    firstSummaryValue(result.summary, [
+      "ending_balance",
+      "closing_balance",
+      "current_balance",
+      "available_balance",
+      "remaining_balance",
+    ]);
+
+  const fromMetadata = moneyLike(extractedBalance);
+  if (fromMetadata !== "-") return fromMetadata;
+
+  const rowsWithBalance = sortRowsByDate(result.transactions).filter((row) => moneyLike(row.balance) !== "-");
+  const latestRow = rowsWithBalance.at(-1);
+  return latestRow ? moneyLike(latestRow.balance) : "-";
 }
 
 function transactionTime(row: ExtractedRow, index: number) {
@@ -466,7 +519,7 @@ export default function Home() {
         );
 
         if (authUser) {
-          void autoSaveHistory(event.fileName as string, txns, summary);
+          void autoSaveHistory(event.fileName as string, txns, metadata, summary);
         }
       } else {
         // Extraction failed for this file — mark it and move on
@@ -527,9 +580,9 @@ export default function Home() {
     }
   }
 
-  async function autoSaveHistory(fileName: string, transactions: ExtractedRow[], summary: unknown) {
+  async function autoSaveHistory(fileName: string, transactions: ExtractedRow[], metadata: DocumentMetadata, summary: unknown) {
     if (!authUser) return;
-    const item = { fileName, transactions, summary };
+    const item = { fileName, transactions, metadata, summary };
 
     if (authUser.isGuest) {
       const localItem: HistoryItem = {
@@ -538,6 +591,7 @@ export default function Home() {
         transactionCount: transactions.length,
         averageConfidence: "96%",
         transactions,
+        metadata,
         summary: summary as Record<string, unknown>,
         createdAt: new Date().toISOString(),
         isLocal: true,
@@ -594,17 +648,21 @@ export default function Home() {
 
   function exportSingleXlsx(result: ScanResult) {
     const wb = XLSX.utils.book_new();
+    const s = stats(result.transactions);
     const metaRows = [
       ["Field", "Value"],
       ["File Name", result.originalName],
       ["Account Holder", result.metadata.account_holder || "-"],
       ["Account Number", result.metadata.account_number || "-"],
       ["Bank Name", result.metadata.bank_name || "-"],
+      ["Remaining Balance", remainingBalance(result)],
       ["Statement Period", [result.metadata.statement_period_start, result.metadata.statement_period_end].filter(Boolean).join(" → ")],
       ["Statement Date", result.metadata.statement_date || "-"],
       [],
       ["Generated", new Date().toLocaleString()],
       ["Total Transactions", result.transactions.length],
+      ["Total Debit", money(s.totalDebit)],
+      ["Total Credit", money(s.totalCredit)],
     ];
     const metaSheet = XLSX.utils.aoa_to_sheet(metaRows);
     metaSheet["!cols"] = [{ wch: 30 }, { wch: 45 }];
@@ -633,9 +691,20 @@ export default function Home() {
     if (done.length === 0) return;
     const wb = XLSX.utils.book_new();
     done.forEach((result) => {
+      const s = stats(result.transactions);
       const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Confidence"];
       const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, r.confidence]);
-      const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+      const infoRows = [
+        ["Account Holder", result.metadata.account_holder || "-"],
+        ["Account Number", result.metadata.account_number || "-"],
+        ["Bank Name", result.metadata.bank_name || "-"],
+        ["Remaining Balance", remainingBalance(result)],
+        ["Transactions", result.transactions.length],
+        ["Total Debit", money(s.totalDebit)],
+        ["Total Credit", money(s.totalCredit)],
+        [],
+      ];
+      const sheet = XLSX.utils.aoa_to_sheet([...infoRows, headers, ...rows]);
       sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 12 }];
       const sheetName = result.originalName.replace(/\.[^/.]+$/, "").slice(0, 30);
       XLSX.utils.book_append_sheet(wb, sheet, sheetName);
@@ -680,6 +749,9 @@ export default function Home() {
       doc.setTextColor(188, 204, 220);
       doc.text(`File: ${result.originalName}`, margin, 60, { maxWidth: pageWidth - 260 });
       doc.text(`Generated: ${generatedAt}`, pageWidth - margin, 60, { align: "right" });
+      doc.text(`Holder: ${displayValue(result.metadata.account_holder)}`, margin, 76, { maxWidth: 230 });
+      doc.text(`Account: ${displayValue(result.metadata.account_number)}`, margin + 250, 76, { maxWidth: 180 });
+      doc.text(`Bank: ${displayValue(result.metadata.bank_name)}`, margin + 450, 76, { maxWidth: pageWidth - margin * 2 - 450 });
     }
 
     function addSummaryCard(label: string, value: string, x: number, y: number, width: number, accent: [number, number, number]) {
@@ -706,7 +778,7 @@ export default function Home() {
     addSummaryCard("Transactions", String(result.transactions.length), margin, summaryTop, cardWidth, [8, 126, 190]);
     addSummaryCard("Total Debit", money(s.totalDebit), margin + (cardWidth + cardGap), summaryTop, cardWidth, [225, 29, 72]);
     addSummaryCard("Total Credit", money(s.totalCredit), margin + (cardWidth + cardGap) * 2, summaryTop, cardWidth, [5, 150, 105]);
-    addSummaryCard("Net Flow", money(s.totalCredit - s.totalDebit), margin + (cardWidth + cardGap) * 3, summaryTop, cardWidth, [99, 102, 241]);
+    addSummaryCard("Remaining Balance", remainingBalance(result), margin + (cardWidth + cardGap) * 3, summaryTop, cardWidth, [99, 102, 241]);
 
     autoTable(doc, {
       startY: summaryTop + 72,
@@ -1105,6 +1177,10 @@ function exportSplitTable(result: ScanResult, kind: "Debit" | "Credit", rows: Ex
   const summaryRows = [
     ["Field", "Value"],
     ["File Name", result.originalName],
+    ["Account Holder", result.metadata.account_holder || "-"],
+    ["Account Number", result.metadata.account_number || "-"],
+    ["Bank Name", result.metadata.bank_name || "-"],
+    ["Remaining Balance", remainingBalance(result)],
     ["Table", `${kind} Transactions`],
     ["Rows", rows.length],
     [`Total ${kind}`, total],
@@ -1152,16 +1228,20 @@ function exportSplitPdf(
 
   doc.setFontSize(10);
   doc.text(`File: ${result.originalName}`, 40, 65);
-  doc.text(`Rows: ${rows.length}`, 40, 82);
-  doc.text(`Total ${kind}: ${money(total)}`, 40, 99);
+  doc.text(`Account Holder: ${displayValue(result.metadata.account_holder)}`, 40, 82);
+  doc.text(`Account Number: ${displayValue(result.metadata.account_number)}`, 40, 99);
+  doc.text(`Bank Name: ${displayValue(result.metadata.bank_name)}`, 40, 116);
+  doc.text(`Remaining Balance: ${remainingBalance(result)}`, 40, 133);
+  doc.text(`Rows: ${rows.length}`, 420, 82);
+  doc.text(`Total ${kind}: ${money(total)}`, 420, 99);
   doc.text(
     `Generated: ${new Date().toLocaleString()}`,
-    40,
+    420,
     116
   );
 
   autoTable(doc, {
-    startY: 140,
+    startY: 156,
     head: [["Date", "Description", kind, "Balance", "Confidence"]],
     body: rows.map((row) => [
       row.date,
@@ -1286,8 +1366,14 @@ function ResultCard({
   onExportPdf: () => void;
 }) {
   const s = stats(result.transactions);
+  const accountDetails = [
+    { label: "Holder", value: displayValue(result.metadata.account_holder) },
+    { label: "Account Number", value: displayValue(result.metadata.account_number) },
+    { label: "Bank", value: displayValue(result.metadata.bank_name) },
+  ];
   const statusColor = result.status === "done" ? "emerald" : result.status === "error" ? "rose" : result.status === "scanning" ? "cyan" : "slate";
   const [isSplitView, setIsSplitView] = useState(false);
+  const [transactionFilter, setTransactionFilter] = useState<TransactionFilter>("All");
   const debitRows = useMemo(
     () => sortRowsByDate(result.transactions.filter((row) => amountValue(row.debit) > 0)),
     [result.transactions]
@@ -1296,6 +1382,16 @@ function ResultCard({
     () => sortRowsByDate(result.transactions.filter((row) => amountValue(row.credit) > 0)),
     [result.transactions]
   );
+  const visibleRows = useMemo(() => {
+    if (transactionFilter === "Debit") return result.transactions.filter((row) => amountValue(row.debit) > 0);
+    if (transactionFilter === "Credit") return result.transactions.filter((row) => amountValue(row.credit) > 0);
+    return result.transactions;
+  }, [result.transactions, transactionFilter]);
+  const filterOptions: { label: TransactionFilter; count: number }[] = [
+    { label: "All", count: result.transactions.length },
+    { label: "Debit", count: debitRows.length },
+    { label: "Credit", count: creditRows.length },
+  ];
 
   return (
     <motion.div
@@ -1393,11 +1489,12 @@ function ResultCard({
             className="overflow-hidden border-t border-white/8">
 
             {/* Stats strip */}
-            <div className="grid grid-cols-3 divide-x divide-white/8 border-b border-white/8">
+            <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-4 md:divide-y-0">
               {[
                 { label: "Transactions", value: result.transactions.length, className: "text-white" },
                 { label: "Total Debit", value: `$${s.totalDebit.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, className: "text-rose-300" },
                 { label: "Total Credit", value: `$${s.totalCredit.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, className: "text-emerald-300" },
+                { label: "Remaining Balance", value: remainingBalance(result), className: "text-cyan-200" },
               ].map(({ label, value, className }) => (
                 <div key={label} className="px-4 py-3 text-center">
                   <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">{label}</p>
@@ -1406,22 +1503,23 @@ function ResultCard({
               ))}
             </div>
 
-            {/* Metadata */}
-            {Object.keys(result.metadata).some((k) => result.metadata[k as keyof DocumentMetadata]) && (
-              <div className="flex flex-wrap gap-x-6 gap-y-1 border-b border-white/8 px-4 py-2.5">
-                {[
-                  ["Holder", result.metadata.account_holder],
-                  ["Account", result.metadata.account_number],
-                  ["Bank", result.metadata.bank_name],
-                  ["Date", result.metadata.statement_date],
-                ].filter(([, v]) => v).map(([label, value]) => (
-                  <div key={label} className="text-xs">
-                    <span className="font-semibold text-slate-500">{label}: </span>
-                    <span className="text-slate-300">{value}</span>
-                  </div>
-                ))}
+            {/* Account details */}
+            <div className="grid gap-px border-b border-white/8 bg-white/[0.08] sm:grid-cols-2 xl:grid-cols-3">
+              {accountDetails.map(({ label, value }) => (
+                <div key={label} className="min-w-0 bg-[#080e1c] px-4 py-3">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">{label}</p>
+                  <p className="mt-1 truncate text-sm font-semibold text-slate-200" title={value}>
+                    {value}
+                  </p>
+                </div>
+              ))}
+              {result.metadata.statement_date && (
+                <div className="min-w-0 bg-[#080e1c] px-4 py-3 xl:hidden">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">Statement Date</p>
+                  <p className="mt-1 truncate text-sm font-semibold text-slate-200">{result.metadata.statement_date}</p>
+                </div>
+              )}
               </div>
-            )}
 
             {/* Transaction table */}
             {isSplitView ? (
@@ -1446,35 +1544,65 @@ function ResultCard({
 />
               </div>
             ) : (
-              <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
-                <table className="w-full min-w-[560px] border-collapse text-left text-xs">
-                  <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                    <tr>
-                      <th className="px-4 py-3">Date</th>
-                      <th className="px-4 py-3">Description</th>
-                      <th className="px-4 py-3 text-right">Debit</th>
-                      <th className="px-4 py-3 text-right">Credit</th>
-                      <th className="px-4 py-3 text-right">Balance</th>
-                      <th className="px-4 py-3">Accuracy</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-white/5">
-                    {result.transactions.map((row) => (
-                      <tr key={row.id} className="transition hover:bg-white/[0.03]">
-                        <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
-                        <td className="max-w-[200px] px-4 py-2.5 text-slate-300">
-                          <div className="line-clamp-2">{row.description}</div>
-                        </td>
-                        <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
-                        <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
-                        <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
-                        <td className="px-4 py-2.5">
-                          <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
-                        </td>
-                      </tr>
+              <div>
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-400">
+                    <Filter className="size-3.5" />
+                    <span>{visibleRows.length} shown</span>
+                  </div>
+                  <div className="flex rounded-lg border border-white/10 bg-white/[0.04] p-1">
+                    {filterOptions.map(({ label, count }) => (
+                      <button
+                        key={label}
+                        onClick={() => setTransactionFilter(label)}
+                        className={`min-w-16 rounded-md px-3 py-1.5 text-xs font-bold transition ${
+                          transactionFilter === label
+                            ? "bg-cyan-400 text-slate-950"
+                            : "text-slate-400 hover:bg-white/[0.07] hover:text-white"
+                        }`}
+                      >
+                        {label} <span className="font-semibold opacity-70">{count}</span>
+                      </button>
                     ))}
-                  </tbody>
-                </table>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
+                  <table className="w-full min-w-[560px] border-collapse text-left text-xs">
+                    <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                      <tr>
+                        <th className="px-4 py-3">Date</th>
+                        <th className="px-4 py-3">Description</th>
+                        <th className="px-4 py-3 text-right">Debit</th>
+                        <th className="px-4 py-3 text-right">Credit</th>
+                        <th className="px-4 py-3 text-right">Balance</th>
+                        <th className="px-4 py-3">Accuracy</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {visibleRows.length > 0 ? visibleRows.map((row) => (
+                        <tr key={row.id} className="transition hover:bg-white/[0.03]">
+                          <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
+                          <td className="max-w-[200px] px-4 py-2.5 text-slate-300">
+                            <div className="line-clamp-2">{row.description}</div>
+                          </td>
+                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
+                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
+                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
+                          <td className="px-4 py-2.5">
+                            <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
+                          </td>
+                        </tr>
+                      )) : (
+                        <tr>
+                          <td colSpan={6} className="px-4 py-8 text-center text-xs text-slate-600">
+                            No {transactionFilter.toLowerCase()} transactions
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             )}
           </motion.div>
