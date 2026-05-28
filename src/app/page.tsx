@@ -649,8 +649,13 @@ export default function Home() {
     if (event.event === "batch_complete") {
       const combinedRows = combineResults(resultsRef.current);
       setShowCombinedTable(combinedRows.length > 0);
-      if (combinedRows.length > 0 && authUser) {
-        void autoSaveCombinedHistory(resultsRef.current, combinedRows);
+      if (authUser) {
+        if (combinedRows.length > 0) {
+          void autoSaveCombinedHistory(resultsRef.current, combinedRows);
+        }
+        resultsRef.current.filter((r) => r.status === "done").forEach((r) => {
+          void saveIndividualHistory(r);
+        });
       }
       // Server confirmed all files processed — nothing extra needed here
       // (isBatchRunning is cleared in the finally block)
@@ -705,6 +710,51 @@ export default function Home() {
       setHistory([]);
     } finally {
       setHistoryLoading(false);
+    }
+  }
+
+  async function saveIndividualHistory(result: ScanResult) {
+    if (!authUser) return;
+
+    const summary = {
+      ...result.summary,
+      kind: "individual_transactions",
+    };
+    const item = { fileName: result.originalName, transactions: result.transactions, metadata: result.metadata, summary };
+
+    if (authUser.isGuest) {
+      const localItem: HistoryItem = {
+        id: `local-${Date.now()}-${Math.random()}`,
+        fileName: result.originalName,
+        transactionCount: result.transactions.length,
+        averageConfidence: null,
+        transactions: result.transactions,
+        metadata: result.metadata,
+        summary,
+        createdAt: new Date().toISOString(),
+        isLocal: true,
+      };
+      setHistory((prev) => {
+        const updated = [localItem, ...prev].slice(0, 12);
+        window.localStorage.setItem(`difm_history_${authUser.id}`, JSON.stringify(updated));
+        return updated;
+      });
+      return;
+    }
+
+    const token = window.localStorage.getItem("difm_token");
+    try {
+      const res = await fetch(`${apiBase}/api/history`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(item),
+      });
+      const p = await res.json();
+      if (res.ok && p.success) {
+        setHistory((prev) => [p.data, ...prev]);
+      }
+    } catch {
+      // silent
     }
   }
 
