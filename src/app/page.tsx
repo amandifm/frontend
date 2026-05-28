@@ -142,6 +142,29 @@ function mapRow(row: Record<string, unknown>, idx: number): ExtractedRow {
   };
 }
 
+function getRowConfidenceValue(row: ExtractedRow): number | null {
+  if (!row.confidence || row.confidence === "-") return null;
+  const match = row.confidence.match(/(\d+(?:\.\d+)?)%/);
+  if (match) return parseFloat(match[1]);
+  const n = parseFloat(row.confidence);
+  if (!isNaN(n)) return n > 1 ? n : n * 100;
+  return null;
+}
+
+function calculateAverageAccuracy(rows: ExtractedRow[]): string {
+  let sum = 0;
+  let count = 0;
+  rows.forEach(row => {
+    const val = getRowConfidenceValue(row);
+    if (val !== null) {
+      sum += val;
+      count++;
+    }
+  });
+  if (count === 0) return "-";
+  return `${Math.round(sum / count)}%`;
+}
+
 function stats(rows: ExtractedRow[]) {
   let td = 0, tc = 0, nd = 0, nc = 0;
   rows.forEach((r) => {
@@ -975,6 +998,7 @@ export default function Home() {
     : 0;
   const totalTxns = results.reduce((acc, r) => acc + r.transactions.length, 0);
   const allRows = combinedRows;
+  const allAccuracy = useMemo(() => calculateAverageAccuracy(allRows), [allRows]);
   const allStats = useMemo(() => stats(allRows), [allRows]);
   const allRevenueStats = useMemo(() => revenueStats(allRows), [allRows]);
   const allFilteredRows = useMemo(() => {
@@ -1131,9 +1155,10 @@ export default function Home() {
         {/* ── Stats Row ── */}
         {hasResults && (
           <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
-            className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
             {[
               { label: "Files Scanned", value: `${completedCount} / ${results.length}`, border: "border-cyan-400/15", text: "text-cyan-200" },
+              { label: "Avg Accuracy", value: allAccuracy, border: "border-indigo-400/15", text: "text-indigo-200" },
               { label: "Total Transactions", value: totalTxns, border: "border-emerald-400/15", text: "text-emerald-200" },
               { label: "Raw Credits", value: money(allRevenueStats.rawCredits), border: "border-emerald-400/15", text: "text-emerald-300" },
               { label: "Adjusted Revenue", value: money(allRevenueStats.adjustedRevenue), border: "border-cyan-400/15", text: "text-cyan-200" },
@@ -1361,8 +1386,9 @@ export default function Home() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-4 md:divide-y-0">
+                <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-5 md:divide-y-0">
                   {[
+                    { label: "Avg Accuracy", value: allAccuracy, className: "text-indigo-300" },
                     { label: "Raw Credits", value: money(allRevenueStats.rawCredits), className: "text-emerald-300" },
                     { label: "Adjusted Revenue", value: money(allRevenueStats.adjustedRevenue), className: "text-cyan-200" },
                     { label: "Credit Deductions", value: money(allRevenueStats.creditDeductions), className: "text-amber-200" },
@@ -1717,6 +1743,7 @@ function ResultCard({
               {result.transactions.length} transactions
               {result.metadata.bank_name && ` · ${result.metadata.bank_name}`}
               {result.metadata.statement_period_start && ` · ${result.metadata.statement_period_start}`}
+              {` · Avg Accuracy: ${calculateAverageAccuracy(result.transactions)}`}
             </p>
           )}
           {result.status === "error" && (
@@ -1784,8 +1811,9 @@ function ResultCard({
             className="overflow-hidden border-t border-white/8">
 
             {/* Stats strip */}
-            <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-4 md:divide-y-0">
+            <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-5 md:divide-y-0">
               {[
+                { label: "Avg Accuracy", value: calculateAverageAccuracy(result.transactions), className: "text-indigo-300" },
                 { label: "Raw Credits", value: money(revenue.rawCredits), className: "text-emerald-300" },
                 { label: "Adjusted Revenue", value: money(revenue.adjustedRevenue), className: "text-cyan-200" },
                 { label: "Credit Deductions", value: money(revenue.creditDeductions), className: "text-amber-200" },
