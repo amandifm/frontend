@@ -78,6 +78,7 @@ type ScanResult = {
   progress: number;
   estimatedSeconds: number;
   remainingSeconds: number;
+  elapsedSeconds?: number;
   error?: string;
   transactions: ExtractedRow[];
   metadata: DocumentMetadata;
@@ -486,6 +487,7 @@ export default function Home() {
       progress: 0,
       estimatedSeconds: estimateExtractionSeconds(f),
       remainingSeconds: estimateExtractionSeconds(f),
+      elapsedSeconds: 0,
       transactions: [],
       metadata: {},
     }));
@@ -665,8 +667,9 @@ export default function Home() {
           r.status === "scanning"
             ? {
                 ...r,
-                progress: Math.min(95, r.progress + 6),
-                remainingSeconds: Math.max(5, r.remainingSeconds - 1),
+                progress: Math.min(95, r.progress + ((r.elapsedSeconds || 0) >= r.estimatedSeconds ? 1 : 6)),
+                remainingSeconds: Math.max(1, r.remainingSeconds - 1),
+                elapsedSeconds: (r.elapsedSeconds || 0) + 1,
               }
             : r
         )
@@ -1859,10 +1862,21 @@ function ResultCard({
           {result.status === "error" && (
             <p className="mt-0.5 truncate text-xs text-rose-400">{result.error}</p>
           )}
-          {result.status === "scanning" && (
+          {result.status === "scanning" && (result.elapsedSeconds || 0) <= result.estimatedSeconds && (
             <p className="mt-0.5 text-xs text-cyan-500/70">
               Extracting transactions · {result.progress}% · ~{formatDuration(remainingSeconds)} left
             </p>
+          )}
+          {result.status === "scanning" && (result.elapsedSeconds || 0) > result.estimatedSeconds && (
+            <div className="mt-1.5 flex items-start gap-2 rounded border border-amber-400/20 bg-amber-400/10 p-2 text-amber-200">
+              <Clock3 className="mt-0.5 size-3.5 shrink-0" />
+              <div>
+                <p className="text-xs font-semibold">Taking longer than expected... ({result.progress}%)</p>
+                <p className="mt-0.5 text-[10px] text-amber-200/80">
+                  This document has dense tables or high page count. The OCR engine is carefully scanning to ensure maximum accuracy. Please bear with us!
+                </p>
+              </div>
+            </div>
           )}
           {result.status === "queued" && (
             <p className="mt-0.5 text-xs text-slate-600">
