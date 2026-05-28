@@ -885,6 +885,109 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  function exportAllPdf() {
+    const done = results.filter((r) => r.status === "done");
+    if (done.length === 0) return;
+    const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
+    const allCombinedRows = combineResults(done);
+    const s = stats(allCombinedRows);
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 36;
+    const generatedAt = new Date().toLocaleString();
+
+    function money(value: number) {
+      return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    }
+
+    function addHeader() {
+      doc.setFillColor(11, 18, 32);
+      doc.rect(0, 0, pageWidth, 92, "F");
+      doc.setFillColor(8, 126, 190);
+      doc.rect(0, 0, 9, 92, "F");
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(22);
+      doc.setTextColor(255, 255, 255);
+      doc.text("Batch Extraction Report", margin, 38);
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(188, 204, 220);
+      doc.text(`Files: ${done.length}`, margin, 60);
+      doc.text(`Generated: ${generatedAt}`, pageWidth - margin, 60, { align: "right" });
+    }
+
+    function addSummaryCard(label: string, value: string, x: number, y: number, width: number, accent: [number, number, number]) {
+      doc.setFillColor(248, 250, 252);
+      doc.setDrawColor(226, 232, 240);
+      doc.roundedRect(x, y, width, 50, 6, 6, "FD");
+      doc.setFillColor(...accent);
+      doc.roundedRect(x, y, 5, 50, 3, 3, "F");
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(100, 116, 139);
+      doc.text(label.toUpperCase(), x + 16, y + 18);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(14);
+      doc.setTextColor(15, 23, 42);
+      doc.text(value, x + 16, y + 38);
+    }
+
+    addHeader();
+
+    const summaryTop = 112;
+    const cardGap = 12;
+    const cardWidth = (pageWidth - margin * 2 - cardGap * 3) / 4;
+    addSummaryCard("Total Transactions", String(allCombinedRows.length), margin, summaryTop, cardWidth, [8, 126, 190]);
+    addSummaryCard("Total Debit", money(s.totalDebit), margin + (cardWidth + cardGap), summaryTop, cardWidth, [225, 29, 72]);
+    addSummaryCard("Total Credit", money(s.totalCredit), margin + (cardWidth + cardGap) * 2, summaryTop, cardWidth, [5, 150, 105]);
+    addSummaryCard("Average Accuracy", calculateAverageAccuracy(allCombinedRows), margin + (cardWidth + cardGap) * 3, summaryTop, cardWidth, [99, 102, 241]);
+
+    autoTable(doc, {
+      startY: summaryTop + 72,
+      margin: { top: 36, left: margin, right: margin, bottom: 42 },
+      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue", "Accuracy"]],
+      body: allCombinedRows.map((r) => [r.date, r.description, r.debit, r.credit, r.balance, r.type, revenueLabel(r), r.confidence]),
+      tableWidth: pageWidth - margin * 2,
+      styles: {
+        font: "helvetica",
+        fontSize: 7.6,
+        cellPadding: { top: 5, right: 6, bottom: 5, left: 6 },
+        lineColor: [226, 232, 240],
+        lineWidth: 0.35,
+        textColor: [51, 65, 85],
+        overflow: "linebreak",
+        valign: "middle",
+      },
+      headStyles: {
+        fillColor: [8, 126, 190],
+        textColor: 255,
+        fontStyle: "bold",
+        halign: "left",
+        cellPadding: { top: 7, right: 6, bottom: 7, left: 6 },
+      },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+      columnStyles: {
+        0: { cellWidth: 72 },
+        1: { cellWidth: 230 },
+        2: { cellWidth: 70, halign: "right", textColor: [190, 18, 60] },
+        3: { cellWidth: 70, halign: "right", textColor: [4, 120, 87] },
+        4: { cellWidth: 76, halign: "right" },
+        5: { cellWidth: 56, halign: "center" },
+        6: { cellWidth: 90, halign: "center" },
+        7: { cellWidth: 68, halign: "center" },
+      },
+      didDrawPage: (data) => {
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.setTextColor(100, 116, 139);
+        doc.text(`Page ${data.pageNumber}`, pageWidth - margin, pageHeight - 18, { align: "right" });
+      },
+    });
+    doc.save(`batch-report-${Date.now()}.pdf`);
+  }
+
   function exportSinglePdf(result: ScanResult) {
     const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
     const s = stats(result.transactions);
@@ -1260,22 +1363,29 @@ export default function Home() {
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
                 className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
                 <p className="mb-3 text-xs font-bold uppercase tracking-widest text-slate-400">Export All Results</p>
-                <div className="grid grid-cols-[1fr_auto] gap-2">
-                  <button onClick={exportAllXlsx}
-                    className="flex items-center justify-center gap-2 rounded-lg bg-emerald-500 py-2.5 text-sm font-bold text-white shadow-lg shadow-emerald-500/20 transition hover:bg-emerald-400">
-                    <ArrowDownToLine className="size-4" />
-                    Download All as XLSX
-                  </button>
+                <div className="grid grid-cols-1 gap-2">
+                  <div className="grid grid-cols-2 gap-2">
+                    <button onClick={exportAllXlsx}
+                      className="flex items-center justify-center gap-2 rounded-lg border border-emerald-400/30 bg-emerald-400/10 py-2.5 text-xs font-bold text-emerald-300 transition hover:bg-emerald-400/20">
+                      <FileSpreadsheet className="size-4" />
+                      XLSX
+                    </button>
+                    <button onClick={exportAllPdf}
+                      className="flex items-center justify-center gap-2 rounded-lg border border-rose-400/30 bg-rose-400/10 py-2.5 text-xs font-bold text-rose-300 transition hover:bg-rose-400/20">
+                      <FileText className="size-4" />
+                      PDF
+                    </button>
+                  </div>
                   <button
                     onClick={() => setShowCombinedTable((current) => !current)}
-                    title="Show full table"
-                    className={`flex size-11 items-center justify-center rounded-lg border text-slate-100 transition ${
+                    className={`flex w-full items-center justify-center gap-2 rounded-lg border py-2.5 text-sm font-bold transition ${
                       showCombinedTable
-                        ? "border-cyan-400/30 bg-cyan-400/15"
-                        : "border-white/10 bg-white/[0.06] hover:bg-white/[0.1]"
+                        ? "border-cyan-400/30 bg-cyan-400/15 text-cyan-200"
+                        : "border-white/10 bg-white/[0.06] text-white hover:bg-white/[0.1]"
                     }`}
                   >
                     <TableProperties className="size-4" />
+                    {showCombinedTable ? "Hide Full Table" : "Show Full Table"}
                   </button>
                 </div>
               </motion.div>
