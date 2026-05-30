@@ -5,34 +5,53 @@ import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import {
   AlertCircle,
+  AlertTriangle,
   ArrowDownToLine,
+  ArrowLeftRight,
   BadgeDollarSign,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Clock3,
   Database,
   FileSpreadsheet,
   FileText,
   Filter,
+  History,
   KeyRound,
   Layers,
   Loader2,
   LogIn,
   LogOut,
+  Maximize,
+  Minimize,
   ScanLine,
   ShieldCheck,
   TableProperties,
   Trash2,
+  TrendingDown,
+  TrendingUp,
   UploadCloud,
   UserCircle,
   UserPlus,
   X,
+  XCircle,
 } from "lucide-react";
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  ChangeEvent,
+  FormEvent,
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import * as XLSX from "xlsx";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 type AuthMode = "login" | "signup";
 type AuthUser = { id: string; name: string; email: string; role?: string; isGuest?: boolean };
@@ -40,6 +59,10 @@ type AuthForm = { name: string; email: string; password: string };
 
 type FileStatus = "queued" | "scanning" | "done" | "error";
 type TransactionFilter = "All" | "Debit" | "Credit";
+type ActiveTab = "all" | "credits_revenue" | "credits_deduction" | "debits" | "reclassified" | "discarded";
+
+// Reclassification direction: which column the OCR originally put it in vs final resolved type
+type ReclassifyDirection = "credit_to_debit" | "debit_to_credit" | null;
 
 type ExtractedRow = {
   id: string;
@@ -55,6 +78,25 @@ type ExtractedRow = {
   revenueStatus?: "Revenue" | "Deduction" | null;
   revenueExclusionCategory?: string | null;
   revenueExclusionReason?: string | null;
+  // NEW: reclassification fields (detected from type/amount mismatch or backend flag)
+  reclassifiedFrom?: "Credit" | "Debit" | null;
+  reclassificationReason?: string | null;
+  // NEW: discarded flag for rows that couldn't be fully parsed
+  discarded?: boolean;
+  discardReason?: string | null;
+  rawText?: string | null;
+  page?: number | null;
+};
+
+// A discarded row (no amounts parsed, low confidence, or parse failure)
+type DiscardedRow = {
+  id: string;
+  date: string;
+  description: string;
+  rawText: string;
+  page: number;
+  discardReason: string;
+  confidence: string;
 };
 
 type DocumentMetadata = {
@@ -81,6 +123,7 @@ type ScanResult = {
   elapsedSeconds?: number;
   error?: string;
   transactions: ExtractedRow[];
+  discardedRows: DiscardedRow[];
   metadata: DocumentMetadata;
   summary?: Record<string, unknown>;
   revenueAnalysis?: Record<string, unknown>;
@@ -92,13 +135,25 @@ type HistoryItem = {
   transactionCount: number;
   averageConfidence?: string | number | null;
   transactions: ExtractedRow[];
+  discardedRows?: DiscardedRow[];
   metadata?: DocumentMetadata;
   summary?: Record<string, unknown>;
   createdAt: string;
   isLocal?: boolean;
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function getMonthName(dateStr: string) {
+  if (!dateStr) return null;
+  const match = dateStr.match(/^(\d{1,2})[\/\-]/);
+  if (match) {
+    const monthNum = parseInt(match[1], 10);
+    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    return months[monthNum - 1] || null;
+  }
+  return null;
+}
 
 function getSavedUser() {
   if (typeof window === "undefined") return null;
@@ -124,9 +179,42 @@ function fmtConf(v: number | string | null | undefined) {
   return `${Math.round(n > 1 ? n : n * 100)}%`;
 }
 
+/**
+ * Detect if a row was reclassified by the backend:
+ * - type="Credit" but only debit > 0  → credit_to_debit
+ * - type="Debit"  but only credit > 0 → debit_to_credit
+ *
+ * Also inherits explicit reclassification flags from the backend if present.
+ */
+function detectReclassification(row: ExtractedRow): { direction: ReclassifyDirection; reason: string | null } {
+  // Backend may already have flagged it
+  if (row.reclassifiedFrom) {
+    const direction: ReclassifyDirection =
+      row.reclassifiedFrom === "Credit" ? "credit_to_debit" : "debit_to_credit";
+    return { direction, reason: row.reclassificationReason || "Balance delta override" };
+  }
+
+  const debitAmt = amountValue(row.debit);
+  const creditAmt = amountValue(row.credit);
+
+  // OCR column = Credit, but final resolved amount is in Debit
+  if (row.type === "Debit" && debitAmt > 0 && creditAmt === 0) {
+    // This is normal — a debit is a debit, no reclassification
+    return { direction: null, reason: null };
+  }
+  if (row.type === "Credit" && creditAmt === 0 && debitAmt > 0) {
+    return { direction: "credit_to_debit", reason: "OCR placed in Credit column; balance delta confirmed Debit" };
+  }
+  if (row.type === "Debit" && debitAmt === 0 && creditAmt > 0) {
+    return { direction: "debit_to_credit", reason: "OCR placed in Debit column; balance delta confirmed Credit" };
+  }
+
+  return { direction: null, reason: null };
+}
+
 function mapRow(row: Record<string, unknown>, idx: number): ExtractedRow {
   const type = row.type === "Credit" ? "Credit" : "Debit";
-  return {
+  const mapped: ExtractedRow = {
     id: (row.id as string) || `txn-${String(idx + 1).padStart(4, "0")}`,
     date: (row.date as string) || "-",
     description: (row.description as string) || "Transaction",
@@ -140,6 +228,26 @@ function mapRow(row: Record<string, unknown>, idx: number): ExtractedRow {
     revenueStatus: (row.revenue_status as "Revenue" | "Deduction" | null) || null,
     revenueExclusionCategory: (row.revenue_exclusion_category as string | null) || null,
     revenueExclusionReason: (row.revenue_exclusion_reason as string | null) || null,
+    // Reclassification from backend
+    reclassifiedFrom: (row.reclassified_from as "Credit" | "Debit" | null) || null,
+    reclassificationReason: (row.reclassification_reason as string | null) || null,
+    discarded: (row.discarded as boolean) || false,
+    discardReason: (row.discard_reason as string | null) || null,
+    rawText: (row.raw_text as string | null) || null,
+    page: (row.page as number | null) || null,
+  };
+  return mapped;
+}
+
+function mapDiscardedRow(row: Record<string, unknown>, idx: number): DiscardedRow {
+  return {
+    id: (row.id as string) || `disc-${String(idx + 1).padStart(4, "0")}`,
+    date: (row.date as string) || "-",
+    description: (row.description as string) || (row.raw_text as string) || "Unknown",
+    rawText: (row.raw_text as string) || "",
+    page: (row.page as number) || 0,
+    discardReason: (row.discard_reason as string) || "No parseable amounts found",
+    confidence: fmtConf(row.confidence as number),
   };
 }
 
@@ -155,12 +263,9 @@ function getRowConfidenceValue(row: ExtractedRow): number | null {
 function calculateAverageAccuracy(rows: ExtractedRow[]): string {
   let sum = 0;
   let count = 0;
-  rows.forEach(row => {
+  rows.forEach((row) => {
     const val = getRowConfidenceValue(row);
-    if (val !== null) {
-      sum += val;
-      count++;
-    }
+    if (val !== null) { sum += val; count++; }
   });
   if (count === 0) return "-";
   return `${Math.round(sum / count)}%`;
@@ -256,10 +361,8 @@ function remainingBalance(result: ScanResult) {
       "available_balance",
       "remaining_balance",
     ]);
-
   const fromMetadata = moneyLike(extractedBalance);
   if (fromMetadata !== "-") return fromMetadata;
-
   const rowsWithBalance = sortRowsByDate(result.transactions).filter((row) => moneyLike(row.balance) !== "-");
   const latestRow = rowsWithBalance.at(-1);
   return latestRow ? moneyLike(latestRow.balance) : "-";
@@ -268,7 +371,6 @@ function remainingBalance(result: ScanResult) {
 function transactionTime(row: ExtractedRow, index: number) {
   const raw = row.date?.trim();
   if (!raw || raw === "-") return Number.MAX_SAFE_INTEGER - index;
-
   const normalized = raw.replace(/-/g, "/");
   const parts = normalized.split("/").map((p) => Number(p));
   if (parts.length >= 3 && parts.every(Number.isFinite)) {
@@ -280,7 +382,6 @@ function transactionTime(row: ExtractedRow, index: number) {
     const [month, day] = parts;
     return new Date(2000, month - 1, day).getTime();
   }
-
   const parsed = Date.parse(raw);
   return Number.isNaN(parsed) ? Number.MAX_SAFE_INTEGER - index : parsed;
 }
@@ -312,19 +413,29 @@ function rowRenderKey(row: ExtractedRow, index: number) {
 function dedupeRows(rows: ExtractedRow[]) {
   const seen = new Set<string>();
   const unique: ExtractedRow[] = [];
-
   rows.forEach((row) => {
     const key = transactionKey(row);
     if (seen.has(key)) return;
     seen.add(key);
     unique.push(row);
   });
-
   return unique;
 }
 
 function combineResults(results: ScanResult[]) {
-  return sortRowsByDate(dedupeRows(results.filter((result) => result.status === "done").flatMap((result) => result.transactions)));
+  return sortRowsByDate(
+    dedupeRows(
+      results
+        .filter((result) => result.status === "done")
+        .flatMap((result) => result.transactions)
+    )
+  );
+}
+
+function combineDiscarded(results: ScanResult[]): DiscardedRow[] {
+  return results
+    .filter((r) => r.status === "done")
+    .flatMap((r) => r.discardedRows || []);
 }
 
 function estimateExtractionSeconds(file: File) {
@@ -333,21 +444,31 @@ function estimateExtractionSeconds(file: File) {
   const isPdf = file.type === "application/pdf" || extension === "pdf";
   const baseSeconds = isPdf ? 28 : 16;
   const secondsPerMb = isPdf ? 10 : 6;
-
   return Math.min(600, Math.max(20, Math.ceil(baseSeconds + sizeMb * secondsPerMb)));
 }
 
 function formatDuration(totalSeconds: number) {
   const seconds = Math.max(0, Math.ceil(totalSeconds));
   if (seconds < 60) return `${seconds}s`;
-
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
   if (minutes < 60) return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
-
   const hours = Math.floor(minutes / 60);
   const minuteRemainder = minutes % 60;
   return minuteRemainder ? `${hours}h ${minuteRemainder}m` : `${hours}h`;
+}
+
+// ─── Reclassify badge helper ──────────────────────────────────────────────────
+
+/**
+ * A credit that the revenue filter converted to a "Deduction" is a
+ * CREDIT → DEDUCTION reclassification for accounting purposes.
+ * A row whose OCR column vs. balance delta differ is a type reclassification.
+ */
+function getReclassifyInfo(row: ExtractedRow) {
+  const { direction, reason } = detectReclassification(row);
+  const isDeductionReclassify = amountValue(row.credit) > 0 && row.revenueStatus === "Deduction";
+  return { direction, reason, isDeductionReclassify };
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -374,6 +495,7 @@ export default function Home() {
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
   const [results, setResults] = useState<ScanResult[]>([]);
   const [combinedRows, setCombinedRows] = useState<ExtractedRow[]>([]);
+  const [combinedDiscarded, setCombinedDiscarded] = useState<DiscardedRow[]>([]);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
   const [showCombinedTable, setShowCombinedTable] = useState(false);
@@ -386,9 +508,7 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
-  useEffect(() => {
-    resultsRef.current = results;
-  }, [results]);
+  useEffect(() => { resultsRef.current = results; }, [results]);
 
   // ── Auth helpers ──────────────────────────────────────────────────────────
 
@@ -436,6 +556,7 @@ export default function Home() {
     setQueuedFiles([]);
     setResults([]);
     setCombinedRows([]);
+    setCombinedDiscarded([]);
     setHistory([]);
   }
 
@@ -444,10 +565,7 @@ export default function Home() {
   const addFiles = useCallback((incoming: FileList | File[]) => {
     const allowed = ["application/pdf", "image/jpeg", "image/png", "image/jpg", "image/webp"];
     const valid = Array.from(incoming).filter((f) => allowed.includes(f.type));
-    setQueuedFiles((prev) => {
-      const combined = [...prev, ...valid];
-      return combined.slice(0, 10);
-    });
+    setQueuedFiles((prev) => [...prev, ...valid].slice(0, 10));
   }, []);
 
   function getRemainingSeconds(result: ScanResult) {
@@ -474,12 +592,10 @@ export default function Home() {
 
   async function startBatch() {
     if (queuedFiles.length === 0 || isBatchRunning) return;
-
     setIsBatchRunning(true);
     setExpandedIndex(null);
     setShowCombinedTable(false);
 
-    // Initialize result slots
     const initial: ScanResult[] = queuedFiles.map((f, i) => ({
       fileId: `batch-${i}`,
       originalName: f.name,
@@ -489,71 +605,50 @@ export default function Home() {
       remainingSeconds: estimateExtractionSeconds(f),
       elapsedSeconds: 0,
       transactions: [],
+      discardedRows: [],
       metadata: {},
     }));
     resultsRef.current = initial;
     setResults(initial);
     setCombinedRows([]);
+    setCombinedDiscarded([]);
 
     const formData = new FormData();
     queuedFiles.forEach((f) => formData.append("files", f));
-
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
     try {
-      const res = await fetch(`${apiBase}/api/uploads/upload-batch`, {
-        method: "POST",
-        body: formData,
-      });
-
+      const res = await fetch(`${apiBase}/api/uploads/upload-batch`, { method: "POST", body: formData });
       if (!res.ok || !res.body) {
-        // Non-streaming error — read the message then bail
         let errMsg = "Batch upload failed";
         try { const p = await res.json(); errMsg = p.message || errMsg; } catch { /* ignore */ }
         throw new Error(errMsg);
       }
-
       reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-
       while (true) {
         let chunk: ReadableStreamReadResult<Uint8Array>;
-        try {
-          chunk = await reader.read();
-        } catch {
-          // Stream cut mid-batch (network drop, server restart, etc.)
-          // Mark any files still pending and exit the loop gracefully —
-          // files already completed keep their results.
+        try { chunk = await reader.read(); } catch {
           setResults((prev) =>
             prev.map((r) =>
               r.status === "queued" || r.status === "scanning"
-                ? { ...r, status: "error", progress: 100, error: "Connection lost - scan interrupted" }
+                ? { ...r, status: "error", progress: 100, error: "Connection lost" }
                 : r
             )
           );
           break;
         }
-
         if (chunk.done) break;
-
         buffer += decoder.decode(chunk.value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
-
         for (const line of lines) {
           if (!line.trim()) continue;
-          // Each line is fully isolated — a bad event never blocks the next file
-          try {
-            const event = JSON.parse(line);
-            handleStreamEvent(event);
-          } catch {
-            // Malformed NDJSON line — skip and continue
-          }
+          try { handleStreamEvent(JSON.parse(line)); } catch { /* skip malformed */ }
         }
       }
     } catch (err) {
-      // Reaches here only for connection-level failures (fetch itself rejected)
       const msg = err instanceof Error ? err.message : "Connection failed";
       setResults((prev) =>
         prev.map((r) =>
@@ -563,7 +658,6 @@ export default function Home() {
         )
       );
     } finally {
-      // Always release the reader lock and unblock the UI regardless of outcome
       try { reader?.cancel(); } catch { /* ignore */ }
       setIsBatchRunning(false);
       setQueuedFiles([]);
@@ -572,97 +666,82 @@ export default function Home() {
 
   function handleStreamEvent(event: Record<string, unknown>) {
     const idx = event.index as number;
-
     if (event.event === "file_started") {
       setResults((prev) =>
         prev.map((r, i) =>
-          i === idx
-            ? { ...r, status: "scanning", progress: Number(event.progress) || 10, remainingSeconds: r.remainingSeconds || r.estimatedSeconds }
-            : r
+          i === idx ? { ...r, status: "scanning", progress: Number(event.progress) || 10 } : r
         )
       );
       setExpandedIndex(idx);
       return;
     }
-
     if (event.event === "file_done") {
-      // Always update the result — even if parsing the payload fails below,
-      // the file must leave "scanning" state so the next file can proceed.
       if (event.success) {
         let txns: ExtractedRow[] = [];
+        let discarded: DiscardedRow[] = [];
         let metadata: DocumentMetadata = {};
         let summary: Record<string, unknown> | undefined;
         let revenueAnalysis: Record<string, unknown> | undefined;
         let fileId: string | undefined;
-
         try {
           const data = event.data as Record<string, unknown>;
           txns = Array.isArray(data.transactions)
             ? (data.transactions as Record<string, unknown>[]).map(mapRow)
             : [];
+          discarded = Array.isArray(data.discarded_rows)
+            ? (data.discarded_rows as Record<string, unknown>[]).map(mapDiscardedRow)
+            : [];
           metadata = (data.metadata as DocumentMetadata) || {};
           summary = data.summary as Record<string, unknown>;
           revenueAnalysis = data.revenueAnalysis as Record<string, unknown>;
           fileId = data.fileId as string | undefined;
-        } catch {
-          // Payload parse failed — treat as successful scan with 0 transactions
-          // rather than leaving the card stuck in "scanning"
-        }
+        } catch { /* payload parse failed */ }
 
         setResults((prev) => {
           const next = prev.map((r, i) =>
             i === idx
-              ? {
-                  ...r,
-                  status: "done" as const,
-                  progress: 100,
-                  remainingSeconds: 0,
-                  transactions: txns,
-                  metadata,
-                  summary,
-                  revenueAnalysis,
-                  fileId: fileId || r.fileId,
-                }
+              ? { ...r, status: "done" as const, progress: 100, remainingSeconds: 0,
+                  transactions: txns, discardedRows: discarded, metadata, summary,
+                  revenueAnalysis, fileId: fileId || r.fileId }
               : r
           );
           resultsRef.current = next;
           setCombinedRows(combineResults(next));
+          setCombinedDiscarded(combineDiscarded(next));
           return next;
         });
-
       } else {
-        // Extraction failed for this file — mark it and move on
         setResults((prev) => {
           const next = prev.map((r, i) =>
             i === idx
-              ? { ...r, status: "error" as const, progress: 100, remainingSeconds: 0, error: (event.error as string) || "Extraction failed" }
+              ? { ...r, status: "error" as const, progress: 100, remainingSeconds: 0,
+                  error: (event.error as string) || "Extraction failed" }
               : r
           );
           resultsRef.current = next;
           setCombinedRows(combineResults(next));
+          setCombinedDiscarded(combineDiscarded(next));
           return next;
         });
       }
       return;
     }
-
     if (event.event === "batch_complete") {
-      const combinedRows = combineResults(resultsRef.current);
-      setShowCombinedTable(combinedRows.length > 0);
+      const combined = combineResults(resultsRef.current);
+      setShowCombinedTable(combined.length > 0);
       if (authUser) {
-        if (combinedRows.length > 0) {
-          void autoSaveCombinedHistory(resultsRef.current, combinedRows);
+        if (combined.length > 0) {
+          if (resultsRef.current.length > 1) {
+            void autoSaveCombinedHistory(resultsRef.current, combined);
+          } else {
+            resultsRef.current.filter((r) => r.status === "done").forEach((r) => void saveIndividualHistory(r));
+          }
         }
-        resultsRef.current.filter((r) => r.status === "done").forEach((r) => {
-          void saveIndividualHistory(r);
-        });
       }
-      // Server confirmed all files processed — nothing extra needed here
-      // (isBatchRunning is cleared in the finally block)
     }
   }
 
-  // ── History ───────────────────────────────────────────────────────────────
+  // ── Progress timer ────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!isBatchRunning) return;
@@ -683,6 +762,8 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, [isBatchRunning]);
 
+  // ── History ───────────────────────────────────────────────────────────────
+
   async function loadHistory(user: AuthUser) {
     setHistoryLoading(true);
     try {
@@ -690,10 +771,8 @@ export default function Home() {
         const s = window.localStorage.getItem(`difm_history_${user.id}`);
         const items = s ? JSON.parse(s) as HistoryItem[] : [];
         setHistory(items);
-        const latestCombined = items.find((item) => item.summary?.kind === "combined_transactions") || items[0];
-        if (latestCombined && resultsRef.current.length === 0) {
-          restoreHistoryItem(latestCombined, false);
-        }
+        const latest = items.find((item) => item.summary?.kind === "combined_transactions") || items[0];
+        if (latest && resultsRef.current.length === 0) restoreHistoryItem(latest, false);
         return;
       }
       const token = window.localStorage.getItem("difm_token");
@@ -702,26 +781,21 @@ export default function Home() {
       if (!res.ok || !p.success) throw new Error(p.message);
       const items = p.data as HistoryItem[];
       setHistory(items);
-      const latestCombined = items.find((item) => item.summary?.kind === "combined_transactions") || items[0];
-      if (latestCombined && resultsRef.current.length === 0) {
-        restoreHistoryItem(latestCombined, false);
-      }
-    } catch {
-      setHistory([]);
-    } finally {
-      setHistoryLoading(false);
-    }
+      const latest = items.find((item) => item.summary?.kind === "combined_transactions") || items[0];
+      if (latest && resultsRef.current.length === 0) restoreHistoryItem(latest, false);
+    } catch { setHistory([]); } finally { setHistoryLoading(false); }
   }
 
   async function saveIndividualHistory(result: ScanResult) {
     if (!authUser) return;
-
-    const summary = {
-      ...result.summary,
-      kind: "individual_transactions",
+    const summary = { ...result.summary, kind: "individual_transactions" };
+    const item = {
+      fileName: result.originalName,
+      transactions: result.transactions,
+      discardedRows: result.discardedRows,
+      metadata: result.metadata,
+      summary,
     };
-    const item = { fileName: result.originalName, transactions: result.transactions, metadata: result.metadata, summary };
-
     if (authUser.isGuest) {
       const localItem: HistoryItem = {
         id: `local-${Date.now()}-${Math.random()}`,
@@ -729,6 +803,7 @@ export default function Home() {
         transactionCount: result.transactions.length,
         averageConfidence: null,
         transactions: result.transactions,
+        discardedRows: result.discardedRows,
         metadata: result.metadata,
         summary,
         createdAt: new Date().toISOString(),
@@ -741,7 +816,6 @@ export default function Home() {
       });
       return;
     }
-
     const token = window.localStorage.getItem("difm_token");
     try {
       const res = await fetch(`${apiBase}/api/history`, {
@@ -750,28 +824,25 @@ export default function Home() {
         body: JSON.stringify(item),
       });
       const p = await res.json();
-      if (res.ok && p.success) {
-        setHistory((prev) => [p.data, ...prev]);
-      }
-    } catch {
-      // silent
-    }
+      if (res.ok && p.success) setHistory((prev) => [p.data, ...prev]);
+    } catch { /* silent */ }
   }
 
   async function autoSaveCombinedHistory(batchResults: ScanResult[], combinedRows: ExtractedRow[]) {
     if (!authUser) return;
-
-    const sourceFiles = batchResults.filter((result) => result.status === "done").map((result) => result.originalName);
-    const metadata: DocumentMetadata = batchResults.find((result) => result.status === "done")?.metadata || {};
+    const sourceFiles = batchResults.filter((r) => r.status === "done").map((r) => r.originalName);
+    const metadata: DocumentMetadata = batchResults.find((r) => r.status === "done")?.metadata || {};
     const summary = {
       kind: "combined_transactions",
       source_files: sourceFiles,
       source_file_count: sourceFiles.length,
-      duplicate_removed_count: batchResults.filter((result) => result.status === "done").flatMap((result) => result.transactions).length - combinedRows.length,
+      duplicate_removed_count:
+        batchResults.filter((r) => r.status === "done").flatMap((r) => r.transactions).length -
+        combinedRows.length,
+      batch_results: batchResults,
     };
-    const fileName = sourceFiles.length > 1 ? "All Extracted Transactions" : sourceFiles[0] || "Extracted Transactions";
+    const fileName = sourceFiles.length > 1 ? `Batch: ${sourceFiles.length} files` : sourceFiles[0] || "Extracted Transactions";
     const item = { fileName, transactions: combinedRows, metadata, summary };
-
     if (authUser.isGuest) {
       const localItem: HistoryItem = {
         id: `local-${Date.now()}`,
@@ -791,7 +862,6 @@ export default function Home() {
       });
       return;
     }
-
     const token = window.localStorage.getItem("difm_token");
     try {
       const res = await fetch(`${apiBase}/api/history`, {
@@ -800,35 +870,51 @@ export default function Home() {
         body: JSON.stringify(item),
       });
       const p = await res.json();
-      if (res.ok && p.success) {
-        setHistory((prev) => [p.data, ...prev]);
-      }
-    } catch {
-      // silent
-    }
+      if (res.ok && p.success) setHistory((prev) => [p.data, ...prev]);
+    } catch { /* silent */ }
   }
 
   function restoreHistoryItem(item: HistoryItem, expand = true) {
-    const restoredRows = sortRowsByDate(dedupeRows((item.transactions || []).map((row, index) => ({ ...row, id: row.id || `history-${index}` }))));
-    const restored: ScanResult = {
-      fileId: item.id,
-      originalName: item.fileName,
-      status: "done",
-      progress: 100,
-      estimatedSeconds: 0,
-      remainingSeconds: 0,
-      transactions: restoredRows,
-      metadata: item.metadata || {},
-      summary: item.summary,
-      revenueAnalysis: item.summary?.revenue_analysis as Record<string, unknown> | undefined,
-    };
-    resultsRef.current = [restored];
-    setResults([restored]);
-    setCombinedRows(restoredRows);
-    setExpandedIndex(null);
-    setShowCombinedTable(true);
+    if (item.summary?.kind === "combined_transactions" && item.summary.batch_results) {
+      const results = item.summary.batch_results as ScanResult[];
+      resultsRef.current = results;
+      setResults(results);
+      const restoredRows = sortRowsByDate(
+        dedupeRows((item.transactions || []).map((row, index) => ({ ...row, id: row.id || `history-${index}` })))
+      );
+      setCombinedRows(restoredRows);
+      setCombinedDiscarded(item.discardedRows || []);
+      setExpandedIndex(null);
+      setShowCombinedTable(true);
+    } else {
+      const restoredRows = sortRowsByDate(
+        dedupeRows((item.transactions || []).map((row, index) => ({ ...row, id: row.id || `history-${index}` })))
+      );
+      const restored: ScanResult = {
+        fileId: item.id,
+        originalName: item.fileName,
+        status: "done",
+        progress: 100,
+        estimatedSeconds: 0,
+        remainingSeconds: 0,
+        transactions: restoredRows,
+        discardedRows: item.discardedRows || [],
+        metadata: item.metadata || {},
+        summary: item.summary,
+        revenueAnalysis: item.summary?.revenue_analysis as Record<string, unknown> | undefined,
+      };
+      resultsRef.current = [restored];
+      setResults([restored]);
+      setCombinedRows(restoredRows);
+      setCombinedDiscarded(item.discardedRows || []);
+      setExpandedIndex(null);
+      setShowCombinedTable(true);
+    }
     if (expand) {
-      window.setTimeout(() => document.getElementById("all-transactions-table")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      window.setTimeout(
+        () => document.getElementById("all-transactions-table")?.scrollIntoView({ behavior: "smooth", block: "start" }),
+        50
+      );
     }
   }
 
@@ -861,6 +947,8 @@ export default function Home() {
   function exportSingleXlsx(result: ScanResult) {
     const wb = XLSX.utils.book_new();
     const s = stats(result.transactions);
+
+    // Sheet 1: Document Info
     const metaRows = [
       ["Field", "Value"],
       ["File Name", result.originalName],
@@ -869,10 +957,10 @@ export default function Home() {
       ["Bank Name", result.metadata.bank_name || "-"],
       ["Remaining Balance", remainingBalance(result)],
       ["Statement Period", [result.metadata.statement_period_start, result.metadata.statement_period_end].filter(Boolean).join(" → ")],
-      ["Statement Date", result.metadata.statement_date || "-"],
       [],
       ["Generated", new Date().toLocaleString()],
       ["Total Transactions", result.transactions.length],
+      ["Discarded Rows", result.discardedRows.length],
       ["Total Debit", money(s.totalDebit)],
       ["Total Credit", money(s.totalCredit)],
     ];
@@ -880,11 +968,34 @@ export default function Home() {
     metaSheet["!cols"] = [{ wch: 30 }, { wch: 45 }];
     XLSX.utils.book_append_sheet(wb, metaSheet, "Document Info");
 
-    const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue Status", "Revenue Filter Reason", "Confidence"];
-    const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, revenueLabel(r), r.revenueExclusionReason || "", r.confidence]);
+    // Sheet 2: All Transactions with reclassification info
+    const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Reclassified From", "Reclassification Note", "Revenue Status", "Deduction Category", "Deduction Reason", "Confidence"];
+    const rows = result.transactions.map((r) => {
+      const { direction, reason } = detectReclassification(r);
+      return [
+        r.date, r.description,
+        cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance),
+        r.type,
+        direction === "credit_to_debit" ? "Credit → Debit" : direction === "debit_to_credit" ? "Debit → Credit" : "",
+        reason || "",
+        revenueLabel(r),
+        r.revenueExclusionCategory || "",
+        r.revenueExclusionReason || "",
+        r.confidence,
+      ];
+    });
     const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
-    sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 10 }, { wch: 22 }, { wch: 45 }, { wch: 12 }];
+    sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 22 }, { wch: 50 }, { wch: 22 }, { wch: 35 }, { wch: 50 }, { wch: 12 }];
     XLSX.utils.book_append_sheet(wb, sheet, "Transactions");
+
+    // Sheet 3: Discarded Rows
+    if (result.discardedRows.length > 0) {
+      const discHeaders = ["Row ID", "Date", "Description", "Raw Text", "Page", "Discard Reason", "Confidence"];
+      const discRows = result.discardedRows.map((r) => [r.id, r.date, r.description, r.rawText, r.page, r.discardReason, r.confidence]);
+      const discSheet = XLSX.utils.aoa_to_sheet([discHeaders, ...discRows]);
+      discSheet["!cols"] = [{ wch: 14 }, { wch: 12 }, { wch: 40 }, { wch: 60 }, { wch: 8 }, { wch: 40 }, { wch: 12 }];
+      XLSX.utils.book_append_sheet(wb, discSheet, "Discarded Rows");
+    }
 
     const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
     const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
@@ -892,9 +1003,7 @@ export default function Home() {
     const a = document.createElement("a");
     a.href = url;
     a.download = `${result.originalName.replace(/\.[^/.]+$/, "")}-report.xlsx`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   }
 
@@ -902,39 +1011,55 @@ export default function Home() {
     const done = results.filter((r) => r.status === "done");
     if (done.length === 0) return;
     const wb = XLSX.utils.book_new();
-    const combinedHeaders = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue Status", "Revenue Filter Reason", "Confidence"];
-    const combinedRows = combineResults(done).map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, revenueLabel(r), r.revenueExclusionReason || "", r.confidence]);
-    const combinedSheet = XLSX.utils.aoa_to_sheet([combinedHeaders, ...combinedRows]);
-    combinedSheet["!cols"] = [{ wch: 14 }, { wch: 55 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 22 }, { wch: 45 }, { wch: 12 }];
+    const allRows = combineResults(done);
+    const allDiscarded = combineDiscarded(done);
+
+    const combinedHeaders = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Reclassified From", "Reclassify Note", "Revenue Status", "Deduction Category", "Deduction Reason", "Confidence"];
+    const combinedData = allRows.map((r) => {
+      const { direction, reason } = detectReclassification(r);
+      return [
+        r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance),
+        r.type,
+        direction === "credit_to_debit" ? "Credit → Debit" : direction === "debit_to_credit" ? "Debit → Credit" : "",
+        reason || "",
+        revenueLabel(r), r.revenueExclusionCategory || "", r.revenueExclusionReason || "", r.confidence,
+      ];
+    });
+    const combinedSheet = XLSX.utils.aoa_to_sheet([combinedHeaders, ...combinedData]);
+    combinedSheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 22 }, { wch: 50 }, { wch: 22 }, { wch: 35 }, { wch: 50 }, { wch: 12 }];
     XLSX.utils.book_append_sheet(wb, combinedSheet, "All Transactions");
+
+    if (allDiscarded.length > 0) {
+      const discHeaders = ["Row ID", "Date", "Description", "Raw Text", "Page", "Discard Reason", "Confidence"];
+      const discRows = allDiscarded.map((r) => [r.id, r.date, r.description, r.rawText, r.page, r.discardReason, r.confidence]);
+      const discSheet = XLSX.utils.aoa_to_sheet([discHeaders, ...discRows]);
+      XLSX.utils.book_append_sheet(wb, discSheet, "Discarded Rows");
+    }
+
     done.forEach((result) => {
       const s = stats(result.transactions);
-      const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue Status", "Revenue Filter Reason", "Confidence"];
+      const headers = ["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue Status", "Deduction Reason", "Confidence"];
       const rows = result.transactions.map((r) => [r.date, r.description, cleanNum(r.debit), cleanNum(r.credit), cleanNum(r.balance), r.type, revenueLabel(r), r.revenueExclusionReason || "", r.confidence]);
       const infoRows = [
         ["Account Holder", result.metadata.account_holder || "-"],
-        ["Account Number", result.metadata.account_number || "-"],
         ["Bank Name", result.metadata.bank_name || "-"],
-        ["Remaining Balance", remainingBalance(result)],
         ["Transactions", result.transactions.length],
+        ["Discarded", result.discardedRows.length],
         ["Total Debit", money(s.totalDebit)],
         ["Total Credit", money(s.totalCredit)],
         [],
       ];
       const sheet = XLSX.utils.aoa_to_sheet([...infoRows, headers, ...rows]);
-      sheet["!cols"] = [{ wch: 14 }, { wch: 50 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 22 }, { wch: 45 }, { wch: 12 }];
-      const sheetName = result.originalName.replace(/\.[^/.]+$/, "").slice(0, 30);
-      XLSX.utils.book_append_sheet(wb, sheet, sheetName);
+      XLSX.utils.book_append_sheet(wb, sheet, result.originalName.replace(/\.[^/.]+$/, "").slice(0, 30));
     });
+
     const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
     const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = `batch-report-${Date.now()}.xlsx`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   }
 
@@ -949,92 +1074,62 @@ export default function Home() {
     const margin = 36;
     const generatedAt = new Date().toLocaleString();
 
-    function money(value: number) {
-      return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    }
-
     function addHeader() {
       doc.setFillColor(11, 18, 32);
       doc.rect(0, 0, pageWidth, 92, "F");
       doc.setFillColor(8, 126, 190);
       doc.rect(0, 0, 9, 92, "F");
-
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(22);
-      doc.setTextColor(255, 255, 255);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(22); doc.setTextColor(255, 255, 255);
       doc.text("Batch Extraction Report", margin, 38);
-
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(9);
-      doc.setTextColor(188, 204, 220);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(188, 204, 220);
       doc.text(`Files: ${done.length}`, margin, 60);
       doc.text(`Generated: ${generatedAt}`, pageWidth - margin, 60, { align: "right" });
     }
 
     function addSummaryCard(label: string, value: string, x: number, y: number, width: number, accent: [number, number, number]) {
-      doc.setFillColor(248, 250, 252);
-      doc.setDrawColor(226, 232, 240);
+      doc.setFillColor(248, 250, 252); doc.setDrawColor(226, 232, 240);
       doc.roundedRect(x, y, width, 50, 6, 6, "FD");
-      doc.setFillColor(...accent);
-      doc.roundedRect(x, y, 5, 50, 3, 3, "F");
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(8);
-      doc.setTextColor(100, 116, 139);
+      doc.setFillColor(...accent); doc.roundedRect(x, y, 5, 50, 3, 3, "F");
+      doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(100, 116, 139);
       doc.text(label.toUpperCase(), x + 16, y + 18);
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(14);
-      doc.setTextColor(15, 23, 42);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(14); doc.setTextColor(15, 23, 42);
       doc.text(value, x + 16, y + 38);
     }
 
     addHeader();
-
-    const summaryTop = 112;
-    const cardGap = 12;
+    const summaryTop = 112; const cardGap = 12;
     const cardWidth = (pageWidth - margin * 2 - cardGap * 3) / 4;
     addSummaryCard("Total Transactions", String(allCombinedRows.length), margin, summaryTop, cardWidth, [8, 126, 190]);
     addSummaryCard("Total Debit", money(s.totalDebit), margin + (cardWidth + cardGap), summaryTop, cardWidth, [225, 29, 72]);
     addSummaryCard("Total Credit", money(s.totalCredit), margin + (cardWidth + cardGap) * 2, summaryTop, cardWidth, [5, 150, 105]);
-    addSummaryCard("Average Accuracy", calculateAverageAccuracy(allCombinedRows), margin + (cardWidth + cardGap) * 3, summaryTop, cardWidth, [99, 102, 241]);
+    addSummaryCard("Avg Accuracy", calculateAverageAccuracy(allCombinedRows), margin + (cardWidth + cardGap) * 3, summaryTop, cardWidth, [99, 102, 241]);
 
     autoTable(doc, {
       startY: summaryTop + 72,
       margin: { top: 36, left: margin, right: margin, bottom: 42 },
-      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue", "Accuracy"]],
-      body: allCombinedRows.map((r) => [r.date, r.description, r.debit, r.credit, r.balance, r.type, revenueLabel(r), r.confidence]),
+      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Reclassified", "Revenue", "Accuracy"]],
+      body: allCombinedRows.map((r) => {
+        const { direction } = detectReclassification(r);
+        return [r.date, r.description, r.debit, r.credit, r.balance, r.type,
+          direction === "credit_to_debit" ? "C→D" : direction === "debit_to_credit" ? "D→C" : "-",
+          revenueLabel(r), r.confidence];
+      }),
       tableWidth: pageWidth - margin * 2,
-      styles: {
-        font: "helvetica",
-        fontSize: 7.6,
-        cellPadding: { top: 5, right: 6, bottom: 5, left: 6 },
-        lineColor: [226, 232, 240],
-        lineWidth: 0.35,
-        textColor: [51, 65, 85],
-        overflow: "linebreak",
-        valign: "middle",
-      },
-      headStyles: {
-        fillColor: [8, 126, 190],
-        textColor: 255,
-        fontStyle: "bold",
-        halign: "left",
-        cellPadding: { top: 7, right: 6, bottom: 7, left: 6 },
-      },
+      styles: { font: "helvetica", fontSize: 7.6, cellPadding: { top: 5, right: 6, bottom: 5, left: 6 }, lineColor: [226, 232, 240], lineWidth: 0.35, textColor: [51, 65, 85], overflow: "linebreak", valign: "middle" },
+      headStyles: { fillColor: [8, 126, 190], textColor: 255, fontStyle: "bold", halign: "left", cellPadding: { top: 7, right: 6, bottom: 7, left: 6 } },
       alternateRowStyles: { fillColor: [248, 250, 252] },
       columnStyles: {
-        0: { cellWidth: 72 },
-        1: { cellWidth: 230 },
-        2: { cellWidth: 70, halign: "right", textColor: [190, 18, 60] },
-        3: { cellWidth: 70, halign: "right", textColor: [4, 120, 87] },
-        4: { cellWidth: 76, halign: "right" },
-        5: { cellWidth: 56, halign: "center" },
-        6: { cellWidth: 90, halign: "center" },
-        7: { cellWidth: 68, halign: "center" },
+        0: { cellWidth: 60 }, 1: { cellWidth: 200 },
+        2: { cellWidth: 60, halign: "right", textColor: [190, 18, 60] },
+        3: { cellWidth: 60, halign: "right", textColor: [4, 120, 87] },
+        4: { cellWidth: 66, halign: "right" },
+        5: { cellWidth: 44, halign: "center" },
+        6: { cellWidth: 38, halign: "center" },
+        7: { cellWidth: 80, halign: "center" },
+        8: { cellWidth: 56, halign: "center" },
       },
       didDrawPage: (data) => {
-        doc.setFont("helvetica", "normal");
-        doc.setFontSize(8);
-        doc.setTextColor(100, 116, 139);
+        doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(100, 116, 139);
         doc.text(`Page ${data.pageNumber}`, pageWidth - margin, pageHeight - 18, { align: "right" });
       },
     });
@@ -1047,97 +1142,61 @@ export default function Home() {
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
     const margin = 36;
-    const generatedAt = new Date().toLocaleString();
 
-    function money(value: number) {
-      return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    }
+    doc.setFillColor(11, 18, 32); doc.rect(0, 0, pageWidth, 92, "F");
+    doc.setFillColor(8, 126, 190); doc.rect(0, 0, 9, 92, "F");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(22); doc.setTextColor(255, 255, 255);
+    doc.text("Bank Statement Extraction Report", margin, 38);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(188, 204, 220);
+    doc.text(`File: ${result.originalName}`, margin, 60, { maxWidth: pageWidth - 260 });
+    doc.text(`Generated: ${new Date().toLocaleString()}`, pageWidth - margin, 60, { align: "right" });
+    doc.text(`Holder: ${displayValue(result.metadata.account_holder)}`, margin, 76, { maxWidth: 230 });
+    doc.text(`Account: ${displayValue(result.metadata.account_number)}`, margin + 250, 76, { maxWidth: 180 });
+    doc.text(`Bank: ${displayValue(result.metadata.bank_name)}`, margin + 450, 76, { maxWidth: pageWidth - margin * 2 - 450 });
 
-    function addHeader() {
-      doc.setFillColor(11, 18, 32);
-      doc.rect(0, 0, pageWidth, 92, "F");
-      doc.setFillColor(8, 126, 190);
-      doc.rect(0, 0, 9, 92, "F");
-
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(22);
-      doc.setTextColor(255, 255, 255);
-      doc.text("Bank Statement Extraction Report", margin, 38);
-
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(9);
-      doc.setTextColor(188, 204, 220);
-      doc.text(`File: ${result.originalName}`, margin, 60, { maxWidth: pageWidth - 260 });
-      doc.text(`Generated: ${generatedAt}`, pageWidth - margin, 60, { align: "right" });
-      doc.text(`Holder: ${displayValue(result.metadata.account_holder)}`, margin, 76, { maxWidth: 230 });
-      doc.text(`Account: ${displayValue(result.metadata.account_number)}`, margin + 250, 76, { maxWidth: 180 });
-      doc.text(`Bank: ${displayValue(result.metadata.bank_name)}`, margin + 450, 76, { maxWidth: pageWidth - margin * 2 - 450 });
-    }
-
-    function addSummaryCard(label: string, value: string, x: number, y: number, width: number, accent: [number, number, number]) {
-      doc.setFillColor(248, 250, 252);
-      doc.setDrawColor(226, 232, 240);
-      doc.roundedRect(x, y, width, 50, 6, 6, "FD");
-      doc.setFillColor(...accent);
-      doc.roundedRect(x, y, 5, 50, 3, 3, "F");
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(8);
-      doc.setTextColor(100, 116, 139);
-      doc.text(label.toUpperCase(), x + 16, y + 18);
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(14);
-      doc.setTextColor(15, 23, 42);
-      doc.text(value, x + 16, y + 38);
-    }
-
-    addHeader();
-
-    const summaryTop = 112;
-    const cardGap = 12;
+    const summaryTop = 112; const cardGap = 12;
     const cardWidth = (pageWidth - margin * 2 - cardGap * 3) / 4;
-    addSummaryCard("Transactions", String(result.transactions.length), margin, summaryTop, cardWidth, [8, 126, 190]);
-    addSummaryCard("Total Debit", money(s.totalDebit), margin + (cardWidth + cardGap), summaryTop, cardWidth, [225, 29, 72]);
-    addSummaryCard("Total Credit", money(s.totalCredit), margin + (cardWidth + cardGap) * 2, summaryTop, cardWidth, [5, 150, 105]);
-    addSummaryCard("Remaining Balance", remainingBalance(result), margin + (cardWidth + cardGap) * 3, summaryTop, cardWidth, [99, 102, 241]);
+
+    function addCard(label: string, value: string, x: number, accent: [number, number, number]) {
+      doc.setFillColor(248, 250, 252); doc.setDrawColor(226, 232, 240);
+      doc.roundedRect(x, summaryTop, cardWidth, 50, 6, 6, "FD");
+      doc.setFillColor(...accent); doc.roundedRect(x, summaryTop, 5, 50, 3, 3, "F");
+      doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(100, 116, 139);
+      doc.text(label.toUpperCase(), x + 16, summaryTop + 18);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(14); doc.setTextColor(15, 23, 42);
+      doc.text(value, x + 16, summaryTop + 38);
+    }
+    addCard("Transactions", String(result.transactions.length), margin, [8, 126, 190]);
+    addCard("Total Debit", money(s.totalDebit), margin + (cardWidth + cardGap), [225, 29, 72]);
+    addCard("Total Credit", money(s.totalCredit), margin + (cardWidth + cardGap) * 2, [5, 150, 105]);
+    addCard("Remaining Balance", remainingBalance(result), margin + (cardWidth + cardGap) * 3, [99, 102, 241]);
 
     autoTable(doc, {
       startY: summaryTop + 72,
       margin: { top: 36, left: margin, right: margin, bottom: 42 },
-      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Revenue", "Confidence"]],
-      body: result.transactions.map((r) => [r.date, r.description, r.debit, r.credit, r.balance, r.type, revenueLabel(r), r.confidence]),
+      head: [["Date", "Description", "Debit", "Credit", "Balance", "Type", "Reclassified", "Revenue", "Accuracy"]],
+      body: result.transactions.map((r) => {
+        const { direction } = detectReclassification(r);
+        return [r.date, r.description, r.debit, r.credit, r.balance, r.type,
+          direction === "credit_to_debit" ? "C→D" : direction === "debit_to_credit" ? "D→C" : "-",
+          revenueLabel(r), r.confidence];
+      }),
       tableWidth: pageWidth - margin * 2,
-      styles: {
-        font: "helvetica",
-        fontSize: 7.6,
-        cellPadding: { top: 5, right: 6, bottom: 5, left: 6 },
-        lineColor: [226, 232, 240],
-        lineWidth: 0.35,
-        textColor: [51, 65, 85],
-        overflow: "linebreak",
-        valign: "middle",
-      },
-      headStyles: {
-        fillColor: [8, 126, 190],
-        textColor: 255,
-        fontStyle: "bold",
-        halign: "left",
-        cellPadding: { top: 7, right: 6, bottom: 7, left: 6 },
-      },
+      styles: { font: "helvetica", fontSize: 7.6, cellPadding: { top: 5, right: 6, bottom: 5, left: 6 }, lineColor: [226, 232, 240], lineWidth: 0.35, textColor: [51, 65, 85], overflow: "linebreak", valign: "middle" },
+      headStyles: { fillColor: [8, 126, 190], textColor: 255, fontStyle: "bold", halign: "left" },
       alternateRowStyles: { fillColor: [248, 250, 252] },
       columnStyles: {
-        0: { cellWidth: 72 },
-        1: { cellWidth: 230 },
-        2: { cellWidth: 70, halign: "right", textColor: [190, 18, 60] },
-        3: { cellWidth: 70, halign: "right", textColor: [4, 120, 87] },
-        4: { cellWidth: 76, halign: "right" },
-        5: { cellWidth: 56, halign: "center" },
-        6: { cellWidth: 90, halign: "center" },
-        7: { cellWidth: 68, halign: "center" },
+        0: { cellWidth: 60 }, 1: { cellWidth: 200 },
+        2: { cellWidth: 60, halign: "right", textColor: [190, 18, 60] },
+        3: { cellWidth: 60, halign: "right", textColor: [4, 120, 87] },
+        4: { cellWidth: 66, halign: "right" },
+        5: { cellWidth: 44, halign: "center" },
+        6: { cellWidth: 38, halign: "center" },
+        7: { cellWidth: 80, halign: "center" },
+        8: { cellWidth: 56, halign: "center" },
       },
       didDrawPage: (data) => {
-        doc.setFont("helvetica", "normal");
-        doc.setFontSize(8);
-        doc.setTextColor(100, 116, 139);
+        doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(100, 116, 139);
         doc.text(`Page ${data.pageNumber}`, pageWidth - margin, pageHeight - 18, { align: "right" });
       },
     });
@@ -1157,19 +1216,22 @@ export default function Home() {
   const allAccuracy = useMemo(() => calculateAverageAccuracy(allRows), [allRows]);
   const allStats = useMemo(() => stats(allRows), [allRows]);
   const allRevenueStats = useMemo(() => revenueStats(allRows), [allRows]);
+
+  const allReclassifiedRows = useMemo(
+    () => allRows.filter((r) => detectReclassification(r).direction !== null || r.revenueStatus === "Deduction"),
+    [allRows]
+  );
+
   const allFilteredRows = useMemo(() => {
     if (combinedFilter === "Debit") return allRows.filter((row) => amountValue(row.debit) > 0);
     if (combinedFilter === "Credit") return allRows.filter((row) => amountValue(row.credit) > 0);
     return allRows;
   }, [allRows, combinedFilter]);
-  const allDebitCount = useMemo(
-    () => allRows.filter((row) => amountValue(row.debit) > 0).length,
-    [allRows]
-  );
-  const allCreditCount = useMemo(
-    () => allRows.filter((row) => amountValue(row.credit) > 0).length,
-    [allRows]
-  );
+
+  const allDebitCount = useMemo(() => allRows.filter((row) => amountValue(row.debit) > 0).length, [allRows]);
+  const allCreditCount = useMemo(() => allRows.filter((row) => amountValue(row.credit) > 0).length, [allRows]);
+  const totalDiscarded = combinedDiscarded.length;
+  const queuedEstimateSeconds = queuedFiles.reduce((total, file) => total + estimateExtractionSeconds(file), 0);
 
   // ─────────────────────────────────────────────────────────────────────────
   // AUTH GATE
@@ -1180,20 +1242,18 @@ export default function Home() {
       <main className="min-h-screen bg-[#050814] text-white overflow-hidden">
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_20%_10%,rgba(34,211,238,0.18),transparent_40%),radial-gradient(ellipse_at_80%_80%,rgba(16,185,129,0.12),transparent_40%)]" />
         <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:60px_60px]" />
-
         <section className={`relative mx-auto grid min-h-screen items-center gap-8 px-5 py-10 transition-[max-width] duration-300 ${showAuthForm ? "max-w-sm" : "max-w-4xl"}`}>
           {!showAuthForm && (
             <div className="fade-up">
               <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-widest text-cyan-300">
-                <ScanLine className="size-3" />
-                DIFM Bank Extractor
+                <ScanLine className="size-3" />DIFM Bank Extractor
               </div>
               <h1 className="mt-2 max-w-3xl text-5xl font-bold tracking-tight sm:text-7xl leading-[1.05]">
                 <span className="shimmer-text">Scan</span> bank statements.<br />
                 <span className="text-slate-300">Extract transactions.</span>
               </h1>
               <p className="mt-6 max-w-xl text-base leading-7 text-slate-400">
-                Upload up to 10 bank statements at once. The OCR engine scans multiple documents in parallel and streams each result as soon as it is ready.
+                Upload up to 10 bank statements at once. Every transaction is classified — revenue, deduction, reclassified, or discarded — so you get a complete audit-ready picture.
               </p>
               <div className="mt-10 grid gap-3 sm:grid-cols-2 max-w-sm">
                 <button type="button" onClick={() => setShowAuthForm(true)}
@@ -1209,13 +1269,11 @@ export default function Home() {
               </div>
             </div>
           )}
-
           <AnimatePresence mode="wait">
             {showAuthForm && (
               <motion.div key="auth" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }}
                 className="rounded-2xl border border-white/10 bg-slate-950/70 p-6 shadow-2xl backdrop-blur-xl">
-                <button type="button" onClick={() => setShowAuthForm(false)}
-                  className="mb-5 text-sm font-medium text-slate-400 transition hover:text-white">← Back</button>
+                <button type="button" onClick={() => setShowAuthForm(false)} className="mb-5 text-sm font-medium text-slate-400 transition hover:text-white">← Back</button>
                 <div className="mb-6 flex items-center gap-3">
                   <div className="flex size-10 items-center justify-center rounded-lg border border-cyan-400/30 bg-cyan-400/10">
                     <ScanLine className="size-5 text-cyan-300" />
@@ -1275,7 +1333,6 @@ export default function Home() {
 
   const hasResults = results.length > 0;
   const hasQueued = queuedFiles.length > 0;
-  const queuedEstimateSeconds = queuedFiles.reduce((total, file) => total + estimateExtractionSeconds(file), 0);
 
   return (
     <main className="min-h-screen bg-[#050814] text-white">
@@ -1297,29 +1354,27 @@ export default function Home() {
           </div>
           <div className="flex items-center gap-2">
             <div className="hidden items-center gap-2 rounded-lg border border-emerald-400/15 bg-emerald-400/8 px-3 py-1.5 text-xs font-semibold text-emerald-200 sm:flex">
-              <ShieldCheck className="size-3.5" />
-              {authUser.isGuest ? "Guest" : authUser.name}
+              <ShieldCheck className="size-3.5" />{authUser.isGuest ? "Guest" : authUser.name}
             </div>
             <button onClick={logout}
               className="flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05] text-slate-300 transition hover:text-white"
-              title="Logout">
-              <LogOut className="size-4" />
-            </button>
+              title="Logout"><LogOut className="size-4" /></button>
           </div>
         </header>
 
         {/* ── Stats Row ── */}
         {hasResults && (
           <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
-            className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
+            className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-8">
             {[
               { label: "Files Scanned", value: `${completedCount} / ${results.length}`, border: "border-cyan-400/15", text: "text-cyan-200" },
               { label: "Avg Accuracy", value: allAccuracy, border: "border-indigo-400/15", text: "text-indigo-200" },
-              { label: "Total Transactions", value: totalTxns, border: "border-emerald-400/15", text: "text-emerald-200" },
+              { label: "Transactions", value: totalTxns, border: "border-emerald-400/15", text: "text-emerald-200" },
               { label: "Raw Credits", value: money(allRevenueStats.rawCredits), border: "border-emerald-400/15", text: "text-emerald-300" },
-              { label: "Adjusted Revenue", value: money(allRevenueStats.adjustedRevenue), border: "border-cyan-400/15", text: "text-cyan-200" },
-              { label: "Total Debit", value: money(allStats.totalDebit), border: "border-rose-400/15", text: "text-rose-300" },
-              { label: "Scan Status", value: `${scanPercent}%`, border: "border-amber-400/15", text: "text-amber-200" },
+              { label: "Adj. Revenue", value: money(allRevenueStats.adjustedRevenue), border: "border-cyan-400/15", text: "text-cyan-200" },
+              { label: "Deductions", value: money(allRevenueStats.creditDeductions), border: "border-amber-400/15", text: "text-amber-300" },
+              { label: "Total Debits", value: money(allStats.totalDebit), border: "border-rose-400/15", text: "text-rose-300" },
+              { label: "Discarded Rows", value: totalDiscarded, border: totalDiscarded > 0 ? "border-orange-400/25" : "border-white/8", text: totalDiscarded > 0 ? "text-orange-300" : "text-slate-500" },
             ].map(({ label, value, border, text }) => (
               <div key={label} className={`rounded-xl border bg-white/[0.04] p-3 ${border}`}>
                 <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</p>
@@ -1329,10 +1384,10 @@ export default function Home() {
           </motion.div>
         )}
 
-        <div className={`grid gap-5 ${hasResults ? "lg:grid-cols-[380px_1fr]" : ""}`}>
+        <div className={`grid ${hasResults ? "gap-3 lg:grid-cols-8" : "gap-5"}`}>
 
-          {/* ── Left panel: Dropzone + Queue ── */}
-          <div className="flex flex-col gap-4">
+          {/* ── Left panel ── */}
+          <div className={`flex flex-col gap-4 ${hasResults ? "lg:col-span-2" : ""}`}>
 
             {/* Dropzone */}
             <div
@@ -1341,27 +1396,20 @@ export default function Home() {
               onDrop={handleDrop}
               onClick={() => !isBatchRunning && fileInputRef.current?.click()}
               className={`relative flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-all ${
-                isDragOver
-                  ? "border-cyan-400/70 bg-cyan-400/8"
-                  : isBatchRunning
-                  ? "cursor-not-allowed border-white/8 bg-white/[0.02] opacity-50"
+                isDragOver ? "border-cyan-400/70 bg-cyan-400/8"
+                  : isBatchRunning ? "cursor-not-allowed border-white/8 bg-white/[0.02] opacity-50"
                   : "border-white/15 bg-white/[0.03] hover:border-cyan-400/40 hover:bg-white/[0.05]"
               }`}>
               <input ref={fileInputRef} type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp"
                 className="sr-only" onChange={handleFileInput} disabled={isBatchRunning} />
-
               <div className="mb-4 flex size-16 items-center justify-center rounded-2xl border border-white/10 bg-slate-900 shadow-[0_0_40px_rgba(34,211,238,0.15)]">
                 <UploadCloud className={`size-8 transition ${isDragOver ? "text-cyan-300" : "text-slate-400"}`} />
               </div>
-              <p className="text-sm font-semibold text-white">
-                {isDragOver ? "Drop files here" : "Drop files or click to browse"}
-              </p>
+              <p className="text-sm font-semibold text-white">{isDragOver ? "Drop files here" : "Drop files or click to browse"}</p>
               <p className="mt-1 text-xs text-slate-500">PDF, PNG, JPG, WEBP — up to 10 files · 25 MB each</p>
-
               {queuedFiles.length > 0 && (
                 <div className="mt-3 flex items-center gap-1.5 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-bold text-cyan-300">
-                  <Layers className="size-3" />
-                  {queuedFiles.length} / 10 selected
+                  <Layers className="size-3" />{queuedFiles.length} / 10 selected
                 </div>
               )}
             </div>
@@ -1373,9 +1421,7 @@ export default function Home() {
                   className="overflow-hidden rounded-xl border border-white/10 bg-white/[0.03]">
                   <div className="border-b border-white/8 px-4 py-3 flex items-center justify-between">
                     <p className="text-xs font-bold uppercase tracking-widest text-slate-400">Queue</p>
-                    <span className="text-xs text-slate-500">
-                      {queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""} · ~{formatDuration(queuedEstimateSeconds)}
-                    </span>
+                    <span className="text-xs text-slate-500">{queuedFiles.length} file{queuedFiles.length !== 1 ? "s" : ""} · ~{formatDuration(queuedEstimateSeconds)}</span>
                   </div>
                   <ul className="divide-y divide-white/5 max-h-[280px] overflow-y-auto">
                     {queuedFiles.map((f, i) => (
@@ -1386,9 +1432,6 @@ export default function Home() {
                         <span className="shrink-0 rounded-md border border-amber-400/15 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold text-amber-200">
                           ~{formatDuration(estimateExtractionSeconds(f))}
                         </span>
-                        <span className="shrink-0 text-[10px] text-slate-600">
-                          {(f.size / 1024 / 1024).toFixed(1)} MB
-                        </span>
                         <button onClick={(e) => { e.stopPropagation(); removeQueued(i); }} disabled={isBatchRunning}
                           className="shrink-0 text-slate-600 transition hover:text-rose-400 disabled:opacity-30">
                           <X className="size-3.5" />
@@ -1396,15 +1439,10 @@ export default function Home() {
                       </motion.li>
                     ))}
                   </ul>
-
                   <div className="border-t border-white/8 p-3">
                     <button onClick={startBatch} disabled={isBatchRunning || queuedFiles.length === 0}
                       className="flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-400 py-2.5 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400 disabled:shadow-none">
-                      {isBatchRunning ? (
-                        <><Loader2 className="size-4 animate-spin" /> Scanning…</>
-                      ) : (
-                        <><ScanLine className="size-4" /> Start Batch Scan</>
-                      )}
+                      {isBatchRunning ? <><Loader2 className="size-4 animate-spin" /> Scanning…</> : <><ScanLine className="size-4" /> Start Batch Scan</>}
                     </button>
                   </div>
                 </motion.div>
@@ -1420,78 +1458,83 @@ export default function Home() {
                   <div className="grid grid-cols-2 gap-2">
                     <button onClick={exportAllXlsx}
                       className="flex items-center justify-center gap-2 rounded-lg border border-emerald-400/30 bg-emerald-400/10 py-2.5 text-xs font-bold text-emerald-300 transition hover:bg-emerald-400/20">
-                      <FileSpreadsheet className="size-4" />
-                      XLSX
+                      <FileSpreadsheet className="size-4" />XLSX
                     </button>
                     <button onClick={exportAllPdf}
                       className="flex items-center justify-center gap-2 rounded-lg border border-rose-400/30 bg-rose-400/10 py-2.5 text-xs font-bold text-rose-300 transition hover:bg-rose-400/20">
-                      <FileText className="size-4" />
-                      PDF
+                      <FileText className="size-4" />PDF
                     </button>
                   </div>
-                  <button
-                    onClick={() => setShowCombinedTable((current) => !current)}
+                  <button onClick={() => setShowCombinedTable((c) => !c)}
                     className={`flex w-full items-center justify-center gap-2 rounded-lg border py-2.5 text-sm font-bold transition ${
-                      showCombinedTable
-                        ? "border-cyan-400/30 bg-cyan-400/15 text-cyan-200"
-                        : "border-white/10 bg-white/[0.06] text-white hover:bg-white/[0.1]"
-                    }`}
-                  >
-                    <TableProperties className="size-4" />
-                    {showCombinedTable ? "Hide Full Table" : "Show Full Table"}
+                      showCombinedTable ? "border-cyan-400/30 bg-cyan-400/15 text-cyan-200" : "border-white/10 bg-white/[0.06] text-white hover:bg-white/[0.1]"
+                    }`}>
+                    <TableProperties className="size-4" />{showCombinedTable ? "Hide Full Table" : "Show Full Table"}
                   </button>
                 </div>
               </motion.div>
             )}
 
-            {/* Scan history */}
+            {/* History */}
             {!authUser.isGuest && (
-              <div className="rounded-xl border border-white/10 bg-white/[0.03]">
-                <div className="border-b border-white/8 px-4 py-3 flex items-center justify-between">
-                  <p className="text-xs font-bold uppercase tracking-widest text-slate-400">History</p>
-                  <div className="flex items-center gap-1.5 text-xs text-slate-500">
-                    <Database className="size-3" />{history.length}
+              <div className="rounded-xl border border-white/10 bg-[#0b101e] shadow-lg overflow-hidden flex flex-col">
+                <div className="border-b border-white/8 bg-white/[0.02] px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+                  <div className="flex items-center gap-2">
+                    <History className="size-4 text-cyan-400" />
+                    <p className="text-xs font-bold uppercase tracking-widest text-slate-300">History</p>
+                  </div>
+                  <div className="flex items-center gap-1.5 rounded-full bg-white/5 px-2 py-0.5 text-[10px] font-semibold text-slate-400">
+                    {history.length} saved
                   </div>
                 </div>
                 {historyLoading ? (
                   <div className="p-3 space-y-2">
-                    {[1, 2, 3].map((i) => <div key={i} className="h-12 animate-pulse rounded-lg bg-white/[0.05]" />)}
+                    {[1, 2, 3].map((i) => <div key={i} className="h-14 animate-pulse rounded-lg bg-white/[0.05]" />)}
                   </div>
                 ) : history.length > 0 ? (
                   <ul className="divide-y divide-white/5 max-h-[320px] overflow-y-auto">
                     {history.map((item) => (
-                      <li key={item.id} className="flex items-center gap-3 px-4 py-3">
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-xs font-semibold text-white">{item.fileName}</p>
-                          <p className="flex items-center gap-1 text-[10px] text-slate-500">
-                            <Clock3 className="size-2.5" />
-                            {new Date(item.createdAt).toLocaleDateString()}
-                            <span className="ml-1 text-cyan-400/70">{item.transactionCount} txns</span>
-                          </p>
+                      <li key={item.id}
+                        onClick={() => restoreHistoryItem(item)}
+                        className="group flex cursor-pointer items-center gap-3 px-4 py-3 transition hover:bg-white/[0.04]">
+                        
+                        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-cyan-400/10 text-cyan-400 border border-cyan-400/20">
+                          <FileText className="size-4" />
                         </div>
-                        <button onClick={() => deleteHistoryItem(item)}
-                          className="shrink-0 text-slate-600 transition hover:text-rose-400">
-                          <Trash2 className="size-3.5" />
-                        </button>
-                        <button
-                          onClick={() => restoreHistoryItem(item)}
-                          title="Show full table"
-                          className="shrink-0 text-slate-600 transition hover:text-cyan-300"
-                        >
-                          <TableProperties className="size-3.5" />
-                        </button>
+                        
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-semibold text-slate-200 group-hover:text-cyan-300 transition-colors">{item.fileName}</p>
+                          <div className="mt-1 flex items-center gap-2 text-[10px] text-slate-500">
+                            <span className="flex items-center gap-1"><Clock3 className="size-3" />{new Date(item.createdAt).toLocaleDateString()}</span>
+                            <span className="size-1 rounded-full bg-slate-700" />
+                            <span className="flex items-center gap-1 text-emerald-400/80 font-medium"><TableProperties className="size-3" />{item.transactionCount} txns</span>
+                          </div>
+                        </div>
+
+                        <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100">
+                          <button
+                            onClick={(e) => { e.stopPropagation(); deleteHistoryItem(item); }}
+                            className="rounded-md p-1.5 text-slate-500 hover:bg-rose-400/10 hover:text-rose-400 transition"
+                            title="Delete"
+                          >
+                            <Trash2 className="size-4" />
+                          </button>
+                        </div>
                       </li>
                     ))}
                   </ul>
                 ) : (
-                  <p className="px-4 py-6 text-center text-xs text-slate-600">No history yet</p>
+                  <div className="flex flex-col items-center justify-center py-8 text-center">
+                    <Database className="mb-2 size-6 text-slate-700" />
+                    <p className="text-xs text-slate-500">No saved history yet</p>
+                  </div>
                 )}
               </div>
             )}
           </div>
 
-          {/* ── Right panel: Results ── */}
-          <div className="flex flex-col gap-4">
+          {/* ── Right panel ── */}
+          <div className={`flex flex-col gap-4 ${hasResults ? "lg:col-span-6" : ""}`}>
 
             {!hasResults && !hasQueued && (
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
@@ -1511,104 +1554,24 @@ export default function Home() {
               </motion.div>
             )}
 
+            {/* ── Combined Full Table ── */}
             {showCombinedTable && allRows.length > 0 && (
-              <motion.div
-                id="all-transactions-table"
-                initial={{ opacity: 0, y: 16 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="overflow-hidden rounded-2xl border border-cyan-400/20 bg-white/[0.035] shadow-lg"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <TableProperties className="size-4 text-cyan-300" />
-                      <p className="text-sm font-bold text-white">All Extracted Transactions</p>
-                    </div>
-                    <p className="mt-1 text-xs text-slate-500">
-                      {allRows.length} unique rows sorted by date
-                    </p>
-                  </div>
-                  <div className="flex rounded-lg border border-white/10 bg-white/[0.04] p-1">
-                    {[
-                      { label: "All" as const, count: allRows.length },
-                      { label: "Debit" as const, count: allDebitCount },
-                      { label: "Credit" as const, count: allCreditCount },
-                    ].map(({ label, count }) => (
-                      <button
-                        key={label}
-                        onClick={() => setCombinedFilter(label)}
-                        className={`min-w-16 rounded-md px-3 py-1.5 text-xs font-bold transition ${
-                          combinedFilter === label
-                            ? "bg-cyan-400 text-slate-950"
-                            : "text-slate-400 hover:bg-white/[0.07] hover:text-white"
-                        }`}
-                      >
-                        {label} <span className="font-semibold opacity-70">{count}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-5 md:divide-y-0">
-                  {[
-                    { label: "Avg Accuracy", value: allAccuracy, className: "text-indigo-300" },
-                    { label: "Raw Credits", value: money(allRevenueStats.rawCredits), className: "text-emerald-300" },
-                    { label: "Adjusted Revenue", value: money(allRevenueStats.adjustedRevenue), className: "text-cyan-200" },
-                    { label: "Credit Deductions", value: money(allRevenueStats.creditDeductions), className: "text-amber-200" },
-                    { label: "Total Debits", value: money(allStats.totalDebit), className: "text-rose-300" },
-                  ].map(({ label, value, className }) => (
-                    <div key={label} className="px-4 py-3 text-center">
-                      <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">{label}</p>
-                      <p className={`mt-1 text-base font-bold ${className}`}>{value}</p>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="overflow-x-auto" style={{ maxHeight: 520 }}>
-                  <table className="w-full min-w-[780px] border-collapse text-left text-xs">
-                    <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                      <tr>
-                        <th className="px-4 py-3">Date</th>
-                        <th className="px-4 py-3">Description</th>
-                        <th className="px-4 py-3 text-right">Debit</th>
-                        <th className="px-4 py-3 text-right">Credit</th>
-                        <th className="px-4 py-3 text-right">Balance</th>
-                        <th className="px-4 py-3">Revenue</th>
-                        <th className="px-4 py-3">Accuracy</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-white/5">
-                      {allFilteredRows.map((row, rowIndex) => (
-                        <tr key={rowRenderKey(row, rowIndex)} className="transition hover:bg-white/[0.03]">
-                          <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
-                          <td className="max-w-[260px] px-4 py-2.5 text-slate-300" title={row.description}>
-                            <div className="line-clamp-2">{row.description}</div>
-                          </td>
-                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
-                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
-                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
-                          <td className="max-w-[180px] px-4 py-2.5 text-slate-300" title={row.revenueExclusionReason || revenueLabel(row)}>
-                            <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
-                              row.revenueStatus === "Deduction"
-                                ? "bg-amber-400/10 text-amber-200"
-                                : amountValue(row.credit) > 0
-                                  ? "bg-emerald-400/10 text-emerald-300"
-                                  : "bg-white/[0.04] text-slate-500"
-                            }`}>
-                              {revenueLabel(row)}
-                            </span>
-                          </td>
-                          <td className="px-4 py-2.5">
-                            <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </motion.div>
+              <CombinedTransactionTable
+                allRows={allRows}
+                allFilteredRows={allFilteredRows}
+                allDebitCount={allDebitCount}
+                allCreditCount={allCreditCount}
+                allReclassifiedRows={allReclassifiedRows}
+                combinedDiscarded={combinedDiscarded}
+                allRevenueStats={allRevenueStats}
+                allStats={allStats}
+                allAccuracy={allAccuracy}
+                combinedFilter={combinedFilter}
+                setCombinedFilter={setCombinedFilter}
+              />
             )}
 
+            {/* ── Per-file result cards ── */}
             <AnimatePresence>
               {results.map((result, idx) => (
                 <ResultCard
@@ -1631,250 +1594,493 @@ export default function Home() {
   );
 }
 
-// ─── ResultCard component ─────────────────────────────────────────────────────
+// ─── Reclassify badge ─────────────────────────────────────────────────────────
 
-function exportSplitTable(result: ScanResult, kind: "Debit" | "Credit", rows: ExtractedRow[]) {
-  const wb = XLSX.utils.book_new();
-  const amountKey = kind === "Debit" ? "debit" : "credit";
-  const total = rows.reduce((acc, row) => acc + amountValue(row[amountKey]), 0);
-  const tableHeaders = kind === "Credit"
-    ? ["Date", "Description", kind, "Balance", "Revenue Status", "Revenue Filter Reason", "Confidence"]
-    : ["Date", "Description", kind, "Balance", "Confidence"];
-  const tableRows = kind === "Credit"
-    ? rows.map((row) => [row.date, row.description, cleanNum(row[amountKey]), cleanNum(row.balance), revenueLabel(row), row.revenueExclusionReason || "", row.confidence])
-    : rows.map((row) => [row.date, row.description, cleanNum(row[amountKey]), cleanNum(row.balance), row.confidence]);
-  const summaryRows = [
-    ["Field", "Value"],
-    ["File Name", result.originalName],
-    ["Account Holder", result.metadata.account_holder || "-"],
-    ["Account Number", result.metadata.account_number || "-"],
-    ["Bank Name", result.metadata.bank_name || "-"],
-    ["Remaining Balance", remainingBalance(result)],
-    ["Table", `${kind} Transactions`],
-    ["Rows", rows.length],
-    [`Total ${kind}`, total],
-    ["Generated", new Date().toLocaleString()],
-    [],
-    tableHeaders,
-    ...tableRows,
-  ];
-  const sheet = XLSX.utils.aoa_to_sheet(summaryRows);
-  sheet["!cols"] = kind === "Credit"
-    ? [{ wch: 14 }, { wch: 54 }, { wch: 15 }, { wch: 15 }, { wch: 22 }, { wch: 45 }, { wch: 12 }]
-    : [{ wch: 14 }, { wch: 54 }, { wch: 15 }, { wch: 15 }, { wch: 12 }];
-  XLSX.utils.book_append_sheet(wb, sheet, `${kind} Transactions`);
-
-  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
-  const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${result.originalName.replace(/\.[^/.]+$/, "")}-${kind.toLowerCase()}-transactions.xlsx`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-function exportSplitPdf(
-  result: ScanResult,
-  kind: "Debit" | "Credit",
-  rows: ExtractedRow[]
-) {
-  const doc = new jsPDF({
-    orientation: "landscape",
-    unit: "pt",
-    format: "a4",
-  });
-
-  const amountKey = kind === "Debit" ? "debit" : "credit";
-
-  const total = rows.reduce(
-    (acc, row) => acc + amountValue(row[amountKey]),
-    0
-  );
-
-  doc.setFontSize(18);
-  doc.text(`${kind} Transactions Report`, 40, 40);
-
-  doc.setFontSize(10);
-  doc.text(`File: ${result.originalName}`, 40, 65);
-  doc.text(`Account Holder: ${displayValue(result.metadata.account_holder)}`, 40, 82);
-  doc.text(`Account Number: ${displayValue(result.metadata.account_number)}`, 40, 99);
-  doc.text(`Bank Name: ${displayValue(result.metadata.bank_name)}`, 40, 116);
-  doc.text(`Remaining Balance: ${remainingBalance(result)}`, 40, 133);
-  doc.text(`Rows: ${rows.length}`, 420, 82);
-  doc.text(`Total ${kind}: ${money(total)}`, 420, 99);
-  doc.text(
-    `Generated: ${new Date().toLocaleString()}`,
-    420,
-    116
-  );
-
-  autoTable(doc, {
-    startY: 156,
-    head: [["Date", "Description", kind, "Balance", "Confidence"]],
-    body: rows.map((row) => [
-      row.date,
-      row.description,
-      row[amountKey],
-      row.balance,
-      row.confidence,
-    ]),
-    styles: {
-      fontSize: 8,
-      overflow: "linebreak",
-    },
-    headStyles: {
-      fillColor: [8,126,190],
-    },
-    columnStyles: {
-      1: { cellWidth: 280 },
-    },
-  });
-
-  doc.save(
-    `${result.originalName.replace(
-      /\.[^/.]+$/,
-      ""
-    )}-${kind.toLowerCase()}-transactions.pdf`
+function ReclassifyBadge({ direction, reason }: { direction: ReclassifyDirection; reason: string | null }) {
+  if (!direction) return null;
+  const isC2D = direction === "credit_to_debit";
+  return (
+    <div
+      title={reason || ""}
+      className={`inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[10px] font-semibold ${
+        isC2D ? "bg-orange-400/15 text-orange-200 border border-orange-400/20" : "bg-violet-400/15 text-violet-200 border border-violet-400/20"
+      }`}>
+      {isC2D ? <TrendingDown className="size-3" /> : <TrendingUp className="size-3" />}
+      {isC2D ? "Credit → Debit" : "Debit → Credit"}
+    </div>
   );
 }
 
-function SplitTransactionTable({
-  title,
-  rows,
-  kind,
-  onExport,
-  onPdfExport,
-}: {
-  title: string;
-  rows: ExtractedRow[];
-  kind: "Debit" | "Credit";
-  onExport: () => void;
-  onPdfExport: () => void;
-}) {
-  const amountKey = kind === "Debit" ? "debit" : "credit";
-  const total = rows.reduce((acc, row) => acc + amountValue(row[amountKey]), 0);
-  const amountClass = kind === "Debit" ? "text-rose-300" : "text-emerald-300";
-  const buttonClass = kind === "Debit"
-    ? "border-rose-400/20 bg-rose-400/10 text-rose-100 hover:bg-rose-400/15"
-    : "border-emerald-400/20 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15";
+// ─── Deduction badge ──────────────────────────────────────────────────────────
+
+function DeductionBadge({ row }: { row: ExtractedRow }) {
+  if (row.revenueStatus !== "Deduction") return null;
+  return (
+    <div
+      title={row.revenueExclusionReason || row.revenueExclusionCategory || "Revenue deduction"}
+      className="inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[10px] font-semibold bg-amber-400/15 text-amber-200 border border-amber-400/20">
+      <ArrowDownToLine className="size-3" />
+      Credit → Deduction
+    </div>
+  );
+}
+
+// ─── Revenue status cell ──────────────────────────────────────────────────────
+
+function RevenueStatusCell({ row }: { row: ExtractedRow }) {
+  const { direction, reason } = detectReclassification(row);
+  const hasCredit = amountValue(row.credit) > 0;
+  const isDeduction = row.revenueStatus === "Deduction";
+
+  if (direction) {
+    return (
+      <div className="flex flex-col gap-1">
+        <ReclassifyBadge direction={direction} reason={reason} />
+        {isDeduction && <DeductionBadge row={row} />}
+      </div>
+    );
+  }
+  if (isDeduction && hasCredit) {
+    return (
+      <div className="flex flex-col gap-1">
+        <DeductionBadge row={row} />
+        <div className="text-[10px] text-slate-500 truncate max-w-[160px]" title={row.revenueExclusionCategory || ""}>
+          {row.revenueExclusionCategory}
+        </div>
+      </div>
+    );
+  }
+  if (hasCredit) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md bg-emerald-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300 border border-emerald-400/15">
+        <CheckCircle2 className="size-3" /> Revenue
+      </span>
+    );
+  }
+  return <span className="text-[10px] text-slate-600">—</span>;
+}
+
+// ─── Transaction row ──────────────────────────────────────────────────────────
+
+function TxnRow({ row, index }: { row: ExtractedRow; index: number }) {
+  const { direction } = detectReclassification(row);
+  const isDeduction = row.revenueStatus === "Deduction";
+  const isHighlighted = direction !== null || isDeduction;
 
   return (
-    <div className="min-w-0 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02]">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
-        <div>
-          <p className="text-xs font-bold uppercase tracking-widest text-slate-400">{title}</p>
-          <p className={`mt-1 text-sm font-bold ${amountClass}`}>{money(total)} total</p>
+    <tr
+      key={rowRenderKey(row, index)}
+      className={`transition ${
+        direction !== null
+          ? "bg-orange-400/[0.04] hover:bg-orange-400/[0.07]"
+          : isDeduction
+          ? "bg-amber-400/[0.04] hover:bg-amber-400/[0.07]"
+          : "hover:bg-white/[0.03]"
+      }`}>
+      <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
+      <td className="max-w-[220px] px-4 py-2.5 text-slate-300" title={row.description}>
+        <div className="line-clamp-2 text-xs">{row.description}</div>
+      </td>
+      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300 text-xs">{row.debit}</td>
+      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300 text-xs">{row.credit}</td>
+      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300 text-xs">{row.balance}</td>
+      <td className="px-4 py-2.5">
+        <RevenueStatusCell row={row} />
+      </td>
+      <td className="px-4 py-2.5">
+        <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
+      </td>
+    </tr>
+  );
+}
+
+// ─── Discarded rows section ───────────────────────────────────────────────────
+
+function DiscardedSection({ rows }: { rows: DiscardedRow[] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="overflow-hidden rounded-2xl border border-orange-400/20 bg-orange-400/[0.03]">
+      <button
+        onClick={() => setExpanded((c) => !c)}
+        className="flex w-full items-center gap-3 px-4 py-3.5 text-left transition hover:bg-orange-400/[0.05]">
+        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-orange-400/25 bg-orange-400/10">
+          <XCircle className="size-4 text-orange-300" />
         </div>
-<div className="flex items-center gap-2">
-  <button
-    onClick={onPdfExport}
-    className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 py-1.5 text-xs font-semibold text-slate-200 hover:bg-white/[0.1]"
-  >
-    <FileText className="size-3.5" />
-    PDF
-  </button>
+        <div className="flex-1">
+          <p className="text-sm font-semibold text-orange-100">Discarded Transactions</p>
+          <p className="text-xs text-orange-300/70">
+            {rows.length} row{rows.length !== 1 ? "s" : ""} could not be fully parsed and were excluded from the main table
+          </p>
+        </div>
+        <div className="shrink-0 flex items-center gap-2">
+          <span className="rounded-full border border-orange-400/20 bg-orange-400/15 px-2.5 py-0.5 text-[10px] font-bold text-orange-200">
+            {rows.length}
+          </span>
+          {expanded ? <ChevronUp className="size-4 text-orange-300" /> : <ChevronDown className="size-4 text-orange-300" />}
+        </div>
+      </button>
 
-  <button
-    onClick={onExport}
-    className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${buttonClass}`}
-  >
-    <FileSpreadsheet className="size-3.5" />
-    XLSX
-  </button>
-</div>
-      </div>
+      <AnimatePresence>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.22 }}
+            className="overflow-hidden border-t border-orange-400/15">
 
-      <div className="overflow-x-auto" style={{ maxHeight: 320 }}>
-        <table className="w-full min-w-[520px] border-collapse text-left text-xs">
-          <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
-            <tr>
-              <th className="px-4 py-3">Date</th>
-              <th className="px-4 py-3">Description</th>
-              <th className="px-4 py-3 text-right">{kind}</th>
-              {kind === "Credit" && <th className="px-4 py-3">Revenue</th>}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-white/5">
-            {rows.length > 0 ? rows.map((row, rowIndex) => (
-              <tr key={rowRenderKey(row, rowIndex)} className="transition hover:bg-white/[0.03]">
-                <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
-                <td className="max-w-[220px] px-4 py-2.5 text-slate-300" title={row.description}>
-                  <div className="line-clamp-2">{row.description}</div>
-                </td>
-                <td className={`whitespace-nowrap px-4 py-2.5 text-right tabular-nums ${amountClass}`}>{row[amountKey]}</td>
-                {kind === "Credit" && (
-                  <td className="max-w-[160px] px-4 py-2.5 text-slate-300" title={row.revenueExclusionReason || revenueLabel(row)}>
-                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
-                      row.revenueStatus === "Deduction"
-                        ? "bg-amber-400/10 text-amber-200"
-                        : "bg-emerald-400/10 text-emerald-300"
+            {/* Legend */}
+            <div className="flex flex-wrap gap-2 px-4 py-3 border-b border-orange-400/10 bg-orange-400/[0.03]">
+              <p className="text-[11px] text-orange-200/60 w-full mb-1">Common discard reasons:</p>
+              {["No parseable amounts found", "Low confidence", "Header/footer row", "Date parse failure"].map((r) => (
+                <span key={r} className="rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400">{r}</span>
+              ))}
+            </div>
+
+            <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
+              <table className="w-full min-w-[700px] border-collapse text-left text-xs">
+                <thead className="sticky top-0 z-10 bg-[#0d0a00] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                  <tr>
+                    <th className="px-4 py-3">Page</th>
+                    <th className="px-4 py-3">Date</th>
+                    <th className="px-4 py-3">Description / Raw Text</th>
+                    <th className="px-4 py-3">Discard Reason</th>
+                    <th className="px-4 py-3">Confidence</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {rows.map((row, i) => (
+                    <tr key={`${row.id}-${i}`} className="hover:bg-orange-400/[0.03]">
+                      <td className="px-4 py-2.5 text-slate-500">p.{row.page || "?"}</td>
+                      <td className="px-4 py-2.5 text-slate-400 whitespace-nowrap">{row.date || "—"}</td>
+                      <td className="px-4 py-2.5 max-w-[300px]">
+                        <div className="font-medium text-slate-300 line-clamp-1">{row.description}</div>
+                        {row.rawText && row.rawText !== row.description && (
+                          <div className="text-[10px] text-slate-600 line-clamp-1 mt-0.5 font-mono">{row.rawText}</div>
+                        )}
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <span className="rounded-md bg-orange-400/10 border border-orange-400/15 px-2 py-0.5 text-[10px] font-medium text-orange-200">
+                          {row.discardReason}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <span className="rounded bg-slate-700/50 px-1.5 py-0.5 text-[10px] text-slate-400">{row.confidence}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// ─── Reclassified summary callout ─────────────────────────────────────────────
+
+function ReclassifiedCallout({ rows }: { rows: ExtractedRow[] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (rows.length === 0) return null;
+
+  const c2d = rows.filter((r) => detectReclassification(r).direction === "credit_to_debit");
+  const d2c = rows.filter((r) => detectReclassification(r).direction === "debit_to_credit");
+  const deductionOnly = rows.filter((r) => {
+    const { direction } = detectReclassification(r);
+    return direction === null && r.revenueStatus === "Deduction";
+  });
+
+  return (
+    <div className="overflow-hidden rounded-2xl border border-amber-400/20 bg-amber-400/[0.03]">
+      <button
+        onClick={() => setExpanded((c) => !c)}
+        className="flex w-full items-center gap-3 px-4 py-3.5 text-left transition hover:bg-amber-400/[0.04]">
+        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-amber-400/25 bg-amber-400/10">
+          <AlertTriangle className="size-4 text-amber-300" />
+        </div>
+        <div className="flex-1">
+          <p className="text-sm font-semibold text-amber-100">Reclassified & Filtered Transactions</p>
+          <p className="text-xs text-amber-300/70">
+            {c2d.length > 0 && `${c2d.length} Credit→Debit`}
+            {d2c.length > 0 && (c2d.length > 0 ? " · " : "") + `${d2c.length} Debit→Credit`}
+            {deductionOnly.length > 0 && ((c2d.length + d2c.length) > 0 ? " · " : "") + `${deductionOnly.length} Credits filtered as Deductions`}
+          </p>
+        </div>
+        <div className="shrink-0 flex items-center gap-2">
+          <span className="rounded-full border border-amber-400/20 bg-amber-400/15 px-2.5 py-0.5 text-[10px] font-bold text-amber-200">{rows.length}</span>
+          {expanded ? <ChevronUp className="size-4 text-amber-300" /> : <ChevronDown className="size-4 text-amber-300" />}
+        </div>
+      </button>
+
+      <AnimatePresence>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.22 }}
+            className="overflow-hidden border-t border-amber-400/15">
+
+            {/* Legend */}
+            <div className="flex flex-wrap gap-3 px-4 py-3 border-b border-amber-400/10 text-[11px]">
+              <div className="flex items-center gap-1.5">
+                <div className="rounded-md bg-orange-400/15 border border-orange-400/20 px-2 py-0.5 text-[10px] font-semibold text-orange-200">Credit → Debit</div>
+                <span className="text-slate-500">OCR column override by balance delta</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <div className="rounded-md bg-violet-400/15 border border-violet-400/20 px-2 py-0.5 text-[10px] font-semibold text-violet-200">Debit → Credit</div>
+                <span className="text-slate-500">OCR column override by balance delta</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <div className="rounded-md bg-amber-400/15 border border-amber-400/20 px-2 py-0.5 text-[10px] font-semibold text-amber-200">Credit → Deduction</div>
+                <span className="text-slate-500">Credit filtered out of revenue per guidelines</span>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto" style={{ maxHeight: 420 }}>
+              <table className="w-full min-w-[800px] border-collapse text-left text-xs">
+                <thead className="sticky top-0 z-10 bg-[#0c0900] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                  <tr>
+                    <th className="px-4 py-3">Date</th>
+                    <th className="px-4 py-3">Description</th>
+                    <th className="px-4 py-3 text-right">Debit</th>
+                    <th className="px-4 py-3 text-right">Credit</th>
+                    <th className="px-4 py-3">Reclassification</th>
+                    <th className="px-4 py-3">Reason / Category</th>
+                    <th className="px-4 py-3">Confidence</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {rows.map((row, i) => {
+                    const { direction, reason } = detectReclassification(row);
+                    const isDeduction = row.revenueStatus === "Deduction";
+                    return (
+                      <tr key={`reclassified-${row.id}-${i}`}
+                        className={direction !== null ? "bg-orange-400/[0.04]" : "bg-amber-400/[0.03]"}>
+                        <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
+                        <td className="max-w-[200px] px-4 py-2.5 text-slate-300">
+                          <div className="line-clamp-2">{row.description}</div>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
+                        <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
+                        <td className="px-4 py-2.5">
+                          {direction && <ReclassifyBadge direction={direction} reason={reason} />}
+                          {!direction && isDeduction && <DeductionBadge row={row} />}
+                        </td>
+                        <td className="max-w-[200px] px-4 py-2.5 text-slate-400 text-[11px]">
+                          {reason || row.revenueExclusionCategory || row.revenueExclusionReason || "—"}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// ─── Combined transaction table ───────────────────────────────────────────────
+
+function CombinedTransactionTable({
+  allRows, allFilteredRows, allDebitCount, allCreditCount, allReclassifiedRows,
+  combinedDiscarded, allRevenueStats, allStats, allAccuracy,
+  combinedFilter, setCombinedFilter,
+}: {
+  allRows: ExtractedRow[];
+  allFilteredRows: ExtractedRow[];
+  allDebitCount: number;
+  allCreditCount: number;
+  allReclassifiedRows: ExtractedRow[];
+  combinedDiscarded: DiscardedRow[];
+  allRevenueStats: { rawCredits: number; adjustedRevenue: number; creditDeductions: number };
+  allStats: { totalDebit: number; totalCredit: number; countDebit: number; countCredit: number };
+  allAccuracy: string;
+  combinedFilter: TransactionFilter;
+  setCombinedFilter: (f: TransactionFilter) => void;
+}) {
+  const [isTableFullscreen, setIsTableFullscreen] = useState(false);
+  return (
+    <div id="all-transactions-table" className="flex flex-col gap-4">
+
+
+      {/* Reclassified callout */}
+      <ReclassifiedCallout rows={allReclassifiedRows} />
+
+      {/* Discarded callout */}
+      <DiscardedSection rows={combinedDiscarded} />
+
+      {/* Main table */}
+      <div className="relative">
+        <AnimatePresence>
+          {isTableFullscreen && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.3 }}
+              className="fixed inset-0 z-[90] bg-black/40 backdrop-blur-md"
+              onClick={() => setIsTableFullscreen(false)}
+            />
+          )}
+        </AnimatePresence>
+
+        <motion.div
+          layout
+          initial={{ opacity: 0, y: 16 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ type: "spring", bounce: 0, duration: 0.4 }}
+          className={isTableFullscreen
+            ? "fixed inset-x-4 top-4 bottom-4 md:inset-x-8 md:top-8 md:bottom-8 z-[100] mx-auto w-[calc(100%-2rem)] md:w-[calc(100%-4rem)] max-w-7xl flex flex-col bg-[#0b101e] rounded-2xl border border-white/10 shadow-2xl overflow-hidden"
+            : "overflow-hidden rounded-2xl border border-cyan-400/20 bg-white/[0.035] shadow-lg"}
+        >
+          {isTableFullscreen && (
+            <div className="flex shrink-0 items-center justify-between px-4 py-3 border-b border-white/8 bg-white/[0.03]">
+              <div className="flex items-center gap-2">
+                <TableProperties className="size-4 text-cyan-400" />
+                <p className="font-semibold text-white">All Extracted Transactions</p>
+              </div>
+              <button onClick={() => setIsTableFullscreen(false)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white">
+                <X className="size-4" />
+              </button>
+            </div>
+          )}
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <TableProperties className="size-4 text-cyan-300" />
+                <p className="text-sm font-bold text-white">All Extracted Transactions</p>
+              </div>
+              <p className="mt-1 text-xs text-slate-500">{allRows.length} unique rows sorted by date · highlighted rows were reclassified or filtered</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="flex rounded-lg border border-white/10 bg-white/[0.04] p-1">
+                {([
+                  { label: "All" as const, count: allRows.length },
+                  { label: "Debit" as const, count: allDebitCount },
+                  { label: "Credit" as const, count: allCreditCount },
+                ]).map(({ label, count }) => (
+                  <button key={label} onClick={() => setCombinedFilter(label)}
+                    className={`min-w-16 rounded-md px-3 py-1.5 text-xs font-bold transition ${
+                      combinedFilter === label ? "bg-cyan-400 text-slate-950" : "text-slate-400 hover:bg-white/[0.07] hover:text-white"
                     }`}>
-                      {revenueLabel(row)}
-                    </span>
-                  </td>
-                )}
-              </tr>
-            )) : (
-              <tr>
-                <td colSpan={kind === "Credit" ? 4 : 3} className="px-4 py-8 text-center text-xs text-slate-600">No {kind.toLowerCase()} transactions</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+                    {label} <span className="font-semibold opacity-70">{count}</span>
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => setIsTableFullscreen(!isTableFullscreen)}
+                className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.1]"
+              >
+                {isTableFullscreen ? <Minimize className="size-3.5" /> : <Maximize className="size-3.5" />}
+                <span className="hidden sm:inline">{isTableFullscreen ? "Exit" : "Expand"}</span>
+              </button>
+            </div>
+          </div>
+
+          <div className={`overflow-auto ${isTableFullscreen ? "flex-1 min-h-0" : "overflow-x-auto"}`} style={{ maxHeight: isTableFullscreen ? "none" : 560 }}>
+            <table className="w-full min-w-[820px] border-collapse text-left text-xs">
+              <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                <tr>
+                  <th className="px-4 py-3">Date</th>
+                  <th className="px-4 py-3">Description</th>
+                  <th className="px-4 py-3 text-right">Debit</th>
+                  <th className="px-4 py-3 text-right">Credit</th>
+                  <th className="px-4 py-3 text-right">Balance</th>
+                  <th className="px-4 py-3">Status / Classification</th>
+                  <th className="px-4 py-3">Accuracy</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                {allFilteredRows.map((row, rowIndex) => {
+                  const prevRow = rowIndex > 0 ? allFilteredRows[rowIndex - 1] : null;
+                  const currentMonth = getMonthName(row.date);
+                  const prevMonth = prevRow ? getMonthName(prevRow.date) : null;
+                  const showMonthHeader = currentMonth && currentMonth !== prevMonth;
+                  return (
+                    <Fragment key={rowRenderKey(row, rowIndex) + "-wrap"}>
+                      {showMonthHeader && (
+                        <tr>
+                          <td colSpan={7} className="bg-[#080e1c]/80 px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-cyan-400 border-y border-white/10">
+                            {currentMonth}
+                          </td>
+                        </tr>
+                      )}
+                      <TxnRow row={row} index={rowIndex} />
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Color legend footer */}
+          <div className="flex flex-wrap items-center gap-4 border-t border-white/8 px-4 py-3 text-[11px]">
+            <span className="text-slate-500 font-medium">Row colors:</span>
+            <div className="flex items-center gap-1.5">
+              <div className="w-3 h-3 rounded-sm bg-orange-400/20 border border-orange-400/30" />
+              <span className="text-slate-400">OCR type reclassified (Credit↔Debit)</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-3 h-3 rounded-sm bg-amber-400/20 border border-amber-400/30" />
+              <span className="text-slate-400">Credit filtered as Deduction</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-3 h-3 rounded-sm bg-white/5 border border-white/10" />
+              <span className="text-slate-400">Standard transaction</span>
+            </div>
+          </div>
+        </motion.div>
       </div>
     </div>
   );
 }
 
+// ─── ResultCard ───────────────────────────────────────────────────────────────
+
+
 function ResultCard({
-  result,
-  index,
-  total,
-  remainingSeconds,
-  isExpanded,
-  onToggle,
-  onExportXlsx,
-  onExportPdf,
+  result, index, total, remainingSeconds, isExpanded, onToggle, onExportXlsx, onExportPdf,
 }: {
-  result: ScanResult;
-  index: number;
-  total: number;
-  remainingSeconds: number;
-  isExpanded: boolean;
-  onToggle: () => void;
-  onExportXlsx: () => void;
-  onExportPdf: () => void;
+  result: ScanResult; index: number; total: number; remainingSeconds: number;
+  isExpanded: boolean; onToggle: () => void; onExportXlsx: () => void; onExportPdf: () => void;
 }) {
   const s = stats(result.transactions);
   const revenue = revenueStats(result.transactions);
-  const accountDetails = [
-    { label: "Holder", value: displayValue(result.metadata.account_holder) },
-    { label: "Account Number", value: displayValue(result.metadata.account_number) },
-    { label: "Bank", value: displayValue(result.metadata.bank_name) },
-  ];
   const statusColor = result.status === "done" ? "emerald" : result.status === "error" ? "rose" : result.status === "scanning" ? "cyan" : "slate";
-  const [isSplitView, setIsSplitView] = useState(false);
   const [transactionFilter, setTransactionFilter] = useState<TransactionFilter>("All");
-  const debitRows = useMemo(
-    () => sortRowsByDate(result.transactions.filter((row) => amountValue(row.debit) > 0)),
+  const [isTableFullscreen, setIsTableFullscreen] = useState(false);
+  const [activeTab, setActiveTab] = useState<ActiveTab>("all");
+
+  const debitRows = useMemo(() => sortRowsByDate(result.transactions.filter((row) => amountValue(row.debit) > 0)), [result.transactions]);
+  const creditRows = useMemo(() => sortRowsByDate(result.transactions.filter((row) => amountValue(row.credit) > 0)), [result.transactions]);
+  const revenueRows = useMemo(() => creditRows.filter((r) => r.revenueStatus !== "Deduction"), [creditRows]);
+  const deductionRows = useMemo(() => creditRows.filter((r) => r.revenueStatus === "Deduction"), [creditRows]);
+  const reclassifiedRows = useMemo(
+    () => result.transactions.filter((r) => detectReclassification(r).direction !== null || r.revenueStatus === "Deduction"),
     [result.transactions]
   );
-  const creditRows = useMemo(
-    () => sortRowsByDate(result.transactions.filter((row) => amountValue(row.credit) > 0)),
-    [result.transactions]
-  );
+
   const visibleRows = useMemo(() => {
     if (transactionFilter === "Debit") return result.transactions.filter((row) => amountValue(row.debit) > 0);
     if (transactionFilter === "Credit") return result.transactions.filter((row) => amountValue(row.credit) > 0);
     return result.transactions;
   }, [result.transactions, transactionFilter]);
-  const filterOptions: { label: TransactionFilter; count: number }[] = [
-    { label: "All", count: result.transactions.length },
-    { label: "Debit", count: debitRows.length },
-    { label: "Credit", count: creditRows.length },
+
+  const accountDetails = [
+    { label: "Holder", value: displayValue(result.metadata.account_holder) },
+    { label: "Account #", value: displayValue(result.metadata.account_number) },
+    { label: "Bank", value: displayValue(result.metadata.bank_name) },
   ];
 
   return (
@@ -1886,69 +2092,55 @@ function ResultCard({
 
       {/* Card header */}
       <div className="flex items-center gap-3 px-4 py-3.5">
-        {/* Status icon */}
         <div className={`flex size-8 shrink-0 items-center justify-center rounded-lg border border-${statusColor}-400/20 bg-${statusColor}-400/10`}>
           {result.status === "scanning" && <Loader2 className="size-4 animate-spin text-cyan-300" />}
           {result.status === "done" && <CheckCircle2 className="size-4 text-emerald-300" />}
           {result.status === "error" && <AlertCircle className="size-4 text-rose-300" />}
           {result.status === "queued" && <Clock3 className="size-4 text-slate-500" />}
         </div>
-
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <p className="truncate text-sm font-semibold text-white">{result.originalName}</p>
             <span className={`shrink-0 rounded-md border border-${statusColor}-400/20 bg-${statusColor}-400/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-${statusColor}-300`}>
               {result.status === "scanning" ? "Scanning" : result.status === "done" ? "Complete" : result.status === "error" ? "Failed" : "Queued"}
             </span>
+            {result.status === "done" && result.discardedRows.length > 0 && (
+              <span className="shrink-0 rounded-md border border-orange-400/20 bg-orange-400/10 px-2 py-0.5 text-[10px] font-bold text-orange-300">
+                {result.discardedRows.length} discarded
+              </span>
+            )}
+            {result.status === "done" && reclassifiedRows.length > 0 && (
+              <span className="shrink-0 rounded-md border border-amber-400/20 bg-amber-400/10 px-2 py-0.5 text-[10px] font-bold text-amber-300">
+                {reclassifiedRows.length} reclassified
+              </span>
+            )}
           </div>
           {result.status === "done" && (
             <p className="mt-0.5 text-xs text-slate-500">
               {result.transactions.length} transactions
               {result.metadata.bank_name && ` · ${result.metadata.bank_name}`}
-              {result.metadata.statement_period_start && ` · ${result.metadata.statement_period_start}`}
-              {` · Avg Accuracy: ${calculateAverageAccuracy(result.transactions)}`}
+              {` · Avg: ${calculateAverageAccuracy(result.transactions)}`}
             </p>
           )}
-          {result.status === "error" && (
-            <p className="mt-0.5 truncate text-xs text-rose-400">{result.error}</p>
-          )}
+          {result.status === "error" && <p className="mt-0.5 truncate text-xs text-rose-400">{result.error}</p>}
           {result.status === "scanning" && (result.elapsedSeconds || 0) <= result.estimatedSeconds && (
-            <p className="mt-0.5 text-xs text-cyan-500/70">
-              Extracting transactions · {result.progress}% · ~{formatDuration(remainingSeconds)} left
-            </p>
+            <p className="mt-0.5 text-xs text-cyan-500/70">Extracting · {result.progress}% · ~{formatDuration(remainingSeconds)} left</p>
           )}
           {result.status === "scanning" && (result.elapsedSeconds || 0) > result.estimatedSeconds && (
             <div className="mt-1.5 flex items-start gap-2 rounded border border-amber-400/20 bg-amber-400/10 p-2 text-amber-200">
               <Clock3 className="mt-0.5 size-3.5 shrink-0" />
               <div>
-                <p className="text-xs font-semibold">Taking longer than expected... ({result.progress}%)</p>
-                <p className="mt-0.5 text-[10px] text-amber-200/80">
-                  This document has dense tables or high page count. The OCR engine is carefully scanning to ensure maximum accuracy. Please bear with us!
-                </p>
+                <p className="text-xs font-semibold">Taking longer than expected… ({result.progress}%)</p>
+                <p className="mt-0.5 text-[10px] text-amber-200/80">Dense tables or high page count — scanning for maximum accuracy.</p>
               </div>
             </div>
           )}
           {result.status === "queued" && (
-            <p className="mt-0.5 text-xs text-slate-600">
-              File {index + 1} of {total} · estimated {formatDuration(result.estimatedSeconds)}
-            </p>
+            <p className="mt-0.5 text-xs text-slate-600">File {index + 1} of {total} · estimated {formatDuration(result.estimatedSeconds)}</p>
           )}
         </div>
-
-        {/* Actions */}
         {result.status === "done" && (
           <div className="flex shrink-0 items-center gap-2">
-            <button onClick={() => {
-              setIsSplitView((current) => !current);
-              if (!isExpanded) onToggle();
-            }}
-              className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${
-                isSplitView
-                  ? "border-cyan-400/30 bg-cyan-400/15 text-cyan-100"
-                  : "border-white/10 bg-white/[0.06] text-slate-200 hover:bg-white/[0.1]"
-              }`}>
-              <Filter className="size-3.5" />{isSplitView ? "Full Table" : "Separate"}
-            </button>
             <button onClick={onExportPdf}
               className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.1]">
               <FileText className="size-3.5" />PDF
@@ -1967,30 +2159,55 @@ function ResultCard({
 
       {(result.status === "queued" || result.status === "scanning") && (
         <div className="relative h-1 overflow-hidden bg-white/5">
-          <div
-            className="h-full bg-cyan-400 transition-all duration-300"
-            style={{ width: `${Math.max(0, Math.min(100, result.progress))}%` }}
-          />
+          <div className="h-full bg-cyan-400 transition-all duration-300" style={{ width: `${Math.max(0, Math.min(100, result.progress))}%` }} />
         </div>
       )}
 
-      {/* Expanded: mini stats + table */}
+      {/* Expanded content */}
       <AnimatePresence>
         {isExpanded && result.status === "done" && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.25 }}
-            className="overflow-hidden border-t border-white/8">
+            className="relative overflow-hidden">
+            
+            <AnimatePresence>
+              {isTableFullscreen && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="fixed inset-0 z-[90] bg-black/40 backdrop-blur-md"
+                  onClick={() => setIsTableFullscreen(false)}
+                />
+              )}
+            </AnimatePresence>
 
+            <motion.div
+              layout
+              transition={{ type: "spring", bounce: 0, duration: 0.4 }}
+              className={isTableFullscreen ? "fixed inset-x-4 top-4 bottom-4 md:inset-x-8 md:top-8 md:bottom-8 z-[100] mx-auto w-[calc(100%-2rem)] md:w-[calc(100%-4rem)] max-w-7xl flex flex-col bg-[#0b101e] rounded-2xl border border-white/10 shadow-2xl overflow-hidden" : "flex flex-col border-t border-white/8"}
+            >
+              {isTableFullscreen && (
+                <div className="flex shrink-0 items-center justify-between px-4 py-3 border-b border-white/8 bg-white/[0.03]">
+                  <div className="flex items-center gap-2">
+                    <FileText className="size-4 text-cyan-400" />
+                    <p className="font-semibold text-white">{result.originalName}</p>
+                  </div>
+                  <button onClick={() => setIsTableFullscreen(false)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white">
+                    <X className="size-4" />
+                  </button>
+                </div>
+              )}
             {/* Stats strip */}
             <div className="grid grid-cols-2 divide-x divide-y divide-white/8 border-b border-white/8 md:grid-cols-5 md:divide-y-0">
               {[
                 { label: "Avg Accuracy", value: calculateAverageAccuracy(result.transactions), className: "text-indigo-300" },
                 { label: "Raw Credits", value: money(revenue.rawCredits), className: "text-emerald-300" },
-                { label: "Adjusted Revenue", value: money(revenue.adjustedRevenue), className: "text-cyan-200" },
-                { label: "Credit Deductions", value: money(revenue.creditDeductions), className: "text-amber-200" },
+                { label: "Adj. Revenue", value: money(revenue.adjustedRevenue), className: "text-cyan-200" },
+                { label: "Deductions", value: money(revenue.creditDeductions), className: "text-amber-200" },
                 { label: "Total Debits", value: money(s.totalDebit), className: "text-rose-300" },
               ].map(({ label, value, className }) => (
                 <div key={label} className="px-4 py-3 text-center">
@@ -2001,71 +2218,170 @@ function ResultCard({
             </div>
 
             {/* Account details */}
-            <div className="grid gap-px border-b border-white/8 bg-white/[0.08] sm:grid-cols-2 xl:grid-cols-3">
+            <div className="grid gap-px border-b border-white/8 bg-white/[0.08] sm:grid-cols-3">
               {accountDetails.map(({ label, value }) => (
                 <div key={label} className="min-w-0 bg-[#080e1c] px-4 py-3">
                   <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">{label}</p>
-                  <p className="mt-1 truncate text-sm font-semibold text-slate-200" title={value}>
-                    {value}
-                  </p>
+                  <p className="mt-1 truncate text-sm font-semibold text-slate-200" title={value}>{value}</p>
                 </div>
               ))}
-              {result.metadata.statement_date && (
-                <div className="min-w-0 bg-[#080e1c] px-4 py-3 xl:hidden">
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">Statement Date</p>
-                  <p className="mt-1 truncate text-sm font-semibold text-slate-200">{result.metadata.statement_date}</p>
-                </div>
-              )}
-              </div>
+            </div>
 
-            {/* Transaction table */}
-            {isSplitView ? (
-              <div className="grid gap-4 p-4 xl:grid-cols-2">
-<SplitTransactionTable
-  title="Debit Transactions"
-  rows={debitRows}
-  kind="Debit"
-  onExport={() => exportSplitTable(result, "Debit", debitRows)}
-  onPdfExport={() =>
-    exportSplitPdf(result, "Debit", debitRows)
-  }
-/>
-<SplitTransactionTable
-  title="Credit Transactions"
-  rows={creditRows}
-  kind="Credit"
-  onExport={() => exportSplitTable(result, "Credit", creditRows)}
-  onPdfExport={() =>
-    exportSplitPdf(result, "Credit", creditRows)
-  }
-/>
+            {/* Reclassified + Discarded callouts */}
+            {(reclassifiedRows.length > 0 || result.discardedRows.length > 0) && (
+              <div className="p-4 flex flex-col gap-3">
+                {reclassifiedRows.length > 0 && <ReclassifiedCallout rows={reclassifiedRows} />}
+                {result.discardedRows.length > 0 && <DiscardedSection rows={result.discardedRows} />}
+              </div>
+            )}
+
+            {/* Tab navigation for transaction views */}
+            <div className="border-b border-white/8 px-4 pt-2 flex gap-1 overflow-x-auto">
+              {([
+                { id: "all" as ActiveTab, label: "All", count: result.transactions.length },
+                { id: "credits_revenue" as ActiveTab, label: "Revenue Credits", count: revenueRows.length, color: "text-emerald-300" },
+                { id: "credits_deduction" as ActiveTab, label: "Deduction Credits", count: deductionRows.length, color: "text-amber-300" },
+                { id: "debits" as ActiveTab, label: "Debits", count: debitRows.length, color: "text-rose-300" },
+                { id: "reclassified" as ActiveTab, label: "Reclassified", count: reclassifiedRows.length, color: "text-orange-300" },
+                { id: "discarded" as ActiveTab, label: "Discarded", count: result.discardedRows.length, color: "text-orange-400" },
+              ]).map(({ id, label, count, color }) => (
+                <button key={id} onClick={() => setActiveTab(id)}
+                  className={`flex items-center gap-1.5 whitespace-nowrap rounded-t-lg px-3 py-2 text-xs font-semibold transition ${
+                    activeTab === id
+                      ? "border-b-2 border-cyan-400 text-white"
+                      : "text-slate-500 hover:text-slate-300"
+                  }`}>
+                  {label}
+                  <span className={`text-[10px] ${activeTab === id ? "text-cyan-300" : (color || "text-slate-600")}`}>({count})</span>
+                </button>
+              ))}
+            </div>
+
+            {/* Transaction table body */}
+            {activeTab === "discarded" ? (
+              <div className="overflow-x-auto p-4">
+                {result.discardedRows.length === 0 ? (
+                  <div className="py-10 text-center text-xs text-slate-600">No discarded rows for this file</div>
+                ) : (
+                  <table className="w-full min-w-[680px] border-collapse text-left text-xs">
+                    <thead className="bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                      <tr>
+                        <th className="px-4 py-3">Page</th>
+                        <th className="px-4 py-3">Date</th>
+                        <th className="px-4 py-3">Description / Raw Text</th>
+                        <th className="px-4 py-3">Discard Reason</th>
+                        <th className="px-4 py-3">Confidence</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {result.discardedRows.map((row, i) => (
+                        <tr key={`disc-${row.id}-${i}`} className="hover:bg-orange-400/[0.03]">
+                          <td className="px-4 py-2.5 text-slate-500">p.{row.page || "?"}</td>
+                          <td className="px-4 py-2.5 text-slate-400 whitespace-nowrap">{row.date || "—"}</td>
+                          <td className="px-4 py-2.5 max-w-[280px]">
+                            <div className="font-medium text-slate-300 line-clamp-1">{row.description}</div>
+                            {row.rawText && row.rawText !== row.description && (
+                              <div className="text-[10px] text-slate-600 font-mono line-clamp-1 mt-0.5">{row.rawText}</div>
+                            )}
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <span className="rounded-md bg-orange-400/10 border border-orange-400/15 px-2 py-0.5 text-[10px] font-medium text-orange-200">
+                              {row.discardReason}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <span className="rounded bg-slate-700/50 px-1.5 py-0.5 text-[10px] text-slate-400">{row.confidence}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            ) : activeTab === "reclassified" ? (
+              <div className="overflow-x-auto" style={{ maxHeight: 400 }}>
+                <table className="w-full min-w-[780px] border-collapse text-left text-xs">
+                  <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                    <tr>
+                      <th className="px-4 py-3">Date</th>
+                      <th className="px-4 py-3">Description</th>
+                      <th className="px-4 py-3 text-right">Debit</th>
+                      <th className="px-4 py-3 text-right">Credit</th>
+                      <th className="px-4 py-3">Reclassification</th>
+                      <th className="px-4 py-3">Reason</th>
+                      <th className="px-4 py-3">Accuracy</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/5">
+                    {reclassifiedRows.length === 0 ? (
+                      <tr><td colSpan={7} className="px-4 py-8 text-center text-xs text-slate-600">No reclassified transactions</td></tr>
+                    ) : reclassifiedRows.map((row, i) => {
+                      const { direction, reason } = detectReclassification(row);
+                      const isDeduction = row.revenueStatus === "Deduction";
+                      return (
+                        <tr key={`rec-${row.id}-${i}`}
+                          className={direction !== null ? "bg-orange-400/[0.04]" : "bg-amber-400/[0.03]"}>
+                          <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
+                          <td className="max-w-[200px] px-4 py-2.5 text-slate-300">
+                            <div className="line-clamp-2">{row.description}</div>
+                          </td>
+                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
+                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
+                          <td className="px-4 py-2.5">
+                            {direction && <ReclassifyBadge direction={direction} reason={reason} />}
+                            {!direction && isDeduction && <DeductionBadge row={row} />}
+                          </td>
+                          <td className="max-w-[180px] px-4 py-2.5 text-slate-400 text-[11px]">
+                            {reason || row.revenueExclusionCategory || row.revenueExclusionReason || "—"}
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
             ) : (
-              <div>
+              /* All / Revenue / Deduction / Debits tab — main table */
+              <div className={isTableFullscreen ? "flex flex-col flex-1 min-h-0" : ""}>
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-400">
-                    <Filter className="size-3.5" />
-                    <span>{visibleRows.length} shown</span>
-                  </div>
-                  <div className="flex rounded-lg border border-white/10 bg-white/[0.04] p-1">
-                    {filterOptions.map(({ label, count }) => (
+                    <div className="flex items-center gap-2 text-xs font-semibold text-slate-400">
+                      <Filter className="size-3.5" />
+                      <span>{activeTab === "credits_revenue" ? revenueRows.length
+                            : activeTab === "credits_deduction" ? deductionRows.length
+                            : activeTab === "debits" ? debitRows.length
+                            : visibleRows.length} shown</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {activeTab === "all" && (
+                        <div className="flex rounded-lg border border-white/10 bg-white/[0.04] p-1">
+                          {([
+                            { label: "All" as const, count: result.transactions.length },
+                            { label: "Debit" as const, count: debitRows.length },
+                            { label: "Credit" as const, count: creditRows.length },
+                          ]).map(({ label, count }) => (
+                            <button key={label} onClick={() => setTransactionFilter(label)}
+                              className={`min-w-14 rounded-md px-3 py-1.5 text-xs font-bold transition ${
+                                transactionFilter === label ? "bg-cyan-400 text-slate-950" : "text-slate-400 hover:bg-white/[0.07] hover:text-white"
+                              }`}>
+                              {label} <span className="font-semibold opacity-70">{count}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
                       <button
-                        key={label}
-                        onClick={() => setTransactionFilter(label)}
-                        className={`min-w-16 rounded-md px-3 py-1.5 text-xs font-bold transition ${
-                          transactionFilter === label
-                            ? "bg-cyan-400 text-slate-950"
-                            : "text-slate-400 hover:bg-white/[0.07] hover:text-white"
-                        }`}
+                        onClick={() => setIsTableFullscreen(!isTableFullscreen)}
+                        className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.1]"
                       >
-                        {label} <span className="font-semibold opacity-70">{count}</span>
+                        {isTableFullscreen ? <Minimize className="size-3.5" /> : <Maximize className="size-3.5" />}
+                        <span className="hidden sm:inline">{isTableFullscreen ? "Exit" : "Expand"}</span>
                       </button>
-                    ))}
+                    </div>
                   </div>
-                </div>
-
-                <div className="overflow-x-auto" style={{ maxHeight: 360 }}>
-                  <table className="w-full min-w-[760px] border-collapse text-left text-xs">
+                <div className={`overflow-auto ${isTableFullscreen ? "flex-1 min-h-0" : "overflow-x-auto"}`} style={{ maxHeight: isTableFullscreen ? "none" : 380 }}>
+                  <table className="w-full min-w-[780px] border-collapse text-left text-xs">
                     <thead className="sticky top-0 z-10 bg-[#080e1c] text-[10px] font-bold uppercase tracking-widest text-slate-500">
                       <tr>
                         <th className="px-4 py-3">Date</th>
@@ -2073,47 +2389,55 @@ function ResultCard({
                         <th className="px-4 py-3 text-right">Debit</th>
                         <th className="px-4 py-3 text-right">Credit</th>
                         <th className="px-4 py-3 text-right">Balance</th>
-                        <th className="px-4 py-3">Revenue</th>
+                        <th className="px-4 py-3">Status / Classification</th>
                         <th className="px-4 py-3">Accuracy</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
-                      {visibleRows.length > 0 ? visibleRows.map((row, rowIndex) => (
-                        <tr key={rowRenderKey(row, rowIndex)} className="transition hover:bg-white/[0.03]">
-                          <td className="whitespace-nowrap px-4 py-2.5 font-medium text-white">{row.date}</td>
-                          <td className="max-w-[200px] px-4 py-2.5 text-slate-300" title={row.description}>
-                            <div className="line-clamp-2">{row.description}</div>
-                          </td>
-                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-rose-300">{row.debit}</td>
-                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-emerald-300">{row.credit}</td>
-                          <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-slate-300">{row.balance}</td>
-                          <td className="max-w-[180px] px-4 py-2.5 text-slate-300" title={row.revenueExclusionReason || revenueLabel(row)}>
-                            <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
-                              row.revenueStatus === "Deduction"
-                                ? "bg-amber-400/10 text-amber-200"
-                                : amountValue(row.credit) > 0
-                                  ? "bg-emerald-400/10 text-emerald-300"
-                                  : "bg-white/[0.04] text-slate-500"
-                            }`}>
-                              {revenueLabel(row)}
-                            </span>
-                          </td>
-                          <td className="px-4 py-2.5">
-                            <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">{row.confidence}</span>
-                          </td>
-                        </tr>
-                      )) : (
-                        <tr>
-                          <td colSpan={7} className="px-4 py-8 text-center text-xs text-slate-600">
-                            No {transactionFilter.toLowerCase()} transactions
-                          </td>
-                        </tr>
-                      )}
+                      {(() => {
+                        const rows = activeTab === "credits_revenue" ? revenueRows
+                          : activeTab === "credits_deduction" ? deductionRows
+                          : activeTab === "debits" ? debitRows
+                          : visibleRows;
+                        if (rows.length === 0) {
+                          return (
+                            <tr><td colSpan={7} className="px-4 py-8 text-center text-xs text-slate-600">
+                              No transactions in this view
+                            </td></tr>
+                          );
+                        }
+                        return rows.map((row, rowIndex) => {
+                          const prevRow = rowIndex > 0 ? rows[rowIndex - 1] : null;
+                          const currentMonth = getMonthName(row.date);
+                          const prevMonth = prevRow ? getMonthName(prevRow.date) : null;
+                          const showMonthHeader = currentMonth && currentMonth !== prevMonth;
+                          return (
+                            <Fragment key={rowRenderKey(row, rowIndex) + "-wrap"}>
+                              {showMonthHeader && (
+                                <tr>
+                                  <td colSpan={7} className="bg-[#080e1c]/80 px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-cyan-400 border-y border-white/10">
+                                    {currentMonth}
+                                  </td>
+                                </tr>
+                              )}
+                              <TxnRow row={row} index={rowIndex} />
+                            </Fragment>
+                          );
+                        });
+                      })()}
                     </tbody>
                   </table>
                 </div>
+
+                {/* Table footer legend */}
+                <div className="flex flex-wrap items-center gap-4 border-t border-white/8 px-4 py-2.5 text-[10px]">
+                  <span className="text-slate-600">Row highlight:</span>
+                  <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-orange-400/25 border border-orange-400/20" /> OCR type override</span>
+                  <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-amber-400/20 border border-amber-400/20" /> Credit → Deduction</span>
+                </div>
               </div>
             )}
+            </motion.div>
           </motion.div>
         )}
       </AnimatePresence>
