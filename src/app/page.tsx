@@ -9,6 +9,7 @@ import {
   ArrowDownToLine,
   ArrowLeftRight,
   BadgeDollarSign,
+  BookOpen,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -500,6 +501,7 @@ export default function Home() {
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
   const [showCombinedTable, setShowCombinedTable] = useState(false);
   const [combinedFilter, setCombinedFilter] = useState<TransactionFilter>("All");
+  const [showGuidelines, setShowGuidelines] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<ScanResult[]>([]);
@@ -1353,6 +1355,10 @@ export default function Home() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <button onClick={() => setShowGuidelines(true)}
+              className="hidden items-center gap-2 rounded-lg border border-indigo-400/15 bg-indigo-400/8 px-3 py-1.5 text-xs font-semibold text-indigo-200 transition hover:bg-indigo-400/15 sm:flex">
+              <BookOpen className="size-3.5" />Guidelines
+            </button>
             <div className="hidden items-center gap-2 rounded-lg border border-emerald-400/15 bg-emerald-400/8 px-3 py-1.5 text-xs font-semibold text-emerald-200 sm:flex">
               <ShieldCheck className="size-3.5" />{authUser.isGuest ? "Guest" : authUser.name}
             </div>
@@ -1361,6 +1367,148 @@ export default function Home() {
               title="Logout"><LogOut className="size-4" /></button>
           </div>
         </header>
+
+        {/* ── Guidelines Modal ── */}
+        <AnimatePresence>
+          {showGuidelines && (
+            <div className="relative">
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.3 }}
+                className="fixed inset-0 z-[90] bg-black/40 backdrop-blur-md"
+                onClick={() => setShowGuidelines(false)}
+              />
+              <motion.div
+                layout
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 16, scale: 0.95 }}
+                transition={{ type: "spring", bounce: 0, duration: 0.4 }}
+                className="fixed inset-x-4 top-4 bottom-4 md:inset-x-8 md:top-8 md:bottom-8 z-[100] mx-auto w-[calc(100%-2rem)] md:w-[calc(100%-4rem)] max-w-4xl flex flex-col bg-[#0b101e] rounded-2xl border border-white/10 shadow-2xl overflow-hidden"
+              >
+                <div className="flex shrink-0 items-center justify-between px-6 py-4 border-b border-white/8 bg-white/[0.03]">
+                  <div className="flex items-center gap-3">
+                    <div className="flex size-8 items-center justify-center rounded-lg bg-indigo-400/10 text-indigo-400 border border-indigo-400/20">
+                      <BookOpen className="size-4" />
+                    </div>
+                    <p className="font-bold text-white text-lg">Extraction Guidelines</p>
+                  </div>
+                  <button onClick={() => setShowGuidelines(false)} className="rounded-lg p-2 text-slate-400 transition hover:bg-white/10 hover:text-white">
+                    <X className="size-5" />
+                  </button>
+                </div>
+                
+                <div className="flex-1 overflow-y-auto px-6 py-6 text-sm text-slate-300 leading-relaxed space-y-8">
+                  
+                  {/* Core Architecture */}
+                  <section>
+                    <h3 className="text-base font-bold text-cyan-400 mb-3 flex items-center gap-2"><Layers className="size-4" />Core Architecture: Data Separation</h3>
+                    <p className="mb-2">For every single transaction, the AI must capture the <strong>Exact Dollar Amount</strong> and the <strong>Full Description</strong>, separating them into:</p>
+                    <ul className="list-disc pl-5 space-y-1 text-slate-400">
+                      <li><strong className="text-emerald-300">Credits (Deposits):</strong> Incoming funds.</li>
+                      <li><strong className="text-rose-300">Debits (Withdrawals):</strong> Outgoing funds.</li>
+                    </ul>
+                  </section>
+
+                  {/* Revenue Deductions */}
+                  <section>
+                    <h3 className="text-base font-bold text-amber-400 mb-3 flex items-center gap-2"><Filter className="size-4" />Revenue Deductions</h3>
+                    <p className="mb-4">Not all deposits are revenue. The AI MUST automatically identify and filter out the following keywords/scenarios from the Credits/Revenue section. Ensure the AI treats these items as <strong>Deductions</strong> (do not count them toward top-line revenue).</p>
+                    
+                    <div className="grid sm:grid-cols-2 gap-6">
+                      <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+                        <h4 className="font-semibold text-white mb-2">Financing & Loans</h4>
+                        <ul className="list-disc pl-4 space-y-1.5 text-xs text-slate-400">
+                          <li>Advances (including from LOC / OLB / OCC loans)</li>
+                          <li>Deposits coming from a Lender's Name</li>
+                          <li>Deposits from Equipment Finance (e.g., Nextgear Funding, Cashflow Funding, Asset Lease, Personal Loans, etc.)</li>
+                          <li>Overdraft / OD deposits</li>
+                          <li>Provisional credit / Temporary credit adjustments</li>
+                        </ul>
+                      </div>
+
+                      <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+                        <h4 className="font-semibold text-white mb-2">Internal Transfers & Linked Accounts</h4>
+                        <ul className="list-disc pl-4 space-y-1.5 text-xs text-slate-400">
+                          <li>A2A (Account-to-Account) transfers</li>
+                          <li>Cash management (mgmnt) transfers</li>
+                          <li>COL XFER from business</li>
+                          <li>Deposit transfers from specific Account Numbers (e.g., xxxxxx1234)</li>
+                          <li>Deposit transfers from Payroll accounts</li>
+                          <li>Fund transfers / Transfers / XFR / XFER</li>
+                          <li>Mobile banking transfers / Online banking transfers / Online xfer</li>
+                          <li>Online transfers from checking (chk), savings, MMA, or payroll accounts</li>
+                          <li>PC transfers / Telephone transfers / Tele transfers</li>
+                          <li>Deposits from Acorns</li>
+                          <li>Money transfers authorized from the Owner's Name or Business Name</li>
+                        </ul>
+                      </div>
+
+                      <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4 sm:col-span-2">
+                        <h4 className="font-semibold text-white mb-2">Banking Corrections, Reversals & Perks</h4>
+                        <ul className="grid sm:grid-cols-2 gap-x-4 gap-y-1.5 list-disc pl-4 text-xs text-slate-400">
+                          <li>Credit adjustments / Withdrawal Adjustment Debit Card Credit Vouchers</li>
+                          <li>Deposit corrections / Share Draft corrections</li>
+                          <li>Error deposits</li>
+                          <li>Misposted payment transfers</li>
+                          <li>NSF (Non-Sufficient Funds) deposits</li>
+                          <li>Returns / RTN / RET</li>
+                          <li>Cashback / Rewards / Rebates (RBT)</li>
+                          <li>Dividends / Interest</li>
+                          <li>Refunds</li>
+                          <li>Treasury payments (TREAS)</li>
+                          <li>Vouchers / FEES (fee reversals)</li>
+                          <li>Trial deposits / Verify deposits</li>
+                        </ul>
+                      </div>
+                    </div>
+                  </section>
+
+                  {/* Wire Deposits */}
+                  <section className="rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-5">
+                    <h3 className="text-base font-bold text-indigo-300 mb-2">Special Conditional Rule: Wire Deposits</h3>
+                    <p className="mb-3 text-slate-300">Do not blanket-deduct all wires!</p>
+                    <ul className="list-none space-y-2 text-sm">
+                      <li className="flex items-start gap-2">
+                        <CheckCircle2 className="size-5 text-emerald-400 shrink-0" />
+                        <span><strong className="text-emerald-300">Keep as Revenue:</strong> Standard business wires.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <XCircle className="size-5 text-rose-400 shrink-0" />
+                        <span><strong className="text-rose-300">Deduct:</strong> The AI must remove the wire if the sender description matches a Merchant, Merchant's surname, Lender, or an LOC (Line of Credit).</span>
+                      </li>
+                    </ul>
+                  </section>
+
+                  {/* Step-by-Step */}
+                  <section>
+                    <h3 className="text-base font-bold text-white mb-3">Step-by-Step Explanation Breakdown</h3>
+                    <p className="mb-4 text-slate-400">First, the AI must give us a quick snapshot comparing Raw Credits vs. Adjusted Revenue so we can see the exact variance at a glance.</p>
+                    <div className="space-y-4">
+                      <div className="flex gap-4">
+                        <div className="flex size-6 shrink-0 items-center justify-center rounded-full bg-cyan-500/20 text-xs font-bold text-cyan-300">1</div>
+                        <div>
+                          <h4 className="font-bold text-slate-200">Credits Breakdown (The Itemized Filter)</h4>
+                          <p className="text-xs text-slate-400 mt-1">The AI must itemize every single deposit, show the exact particulars/descriptions, and flag whether it was accepted as Revenue or filtered out as a Deduction based on our Master Keyword list (e.g., transfers, loans, etc.).</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-4">
+                        <div className="flex size-6 shrink-0 items-center justify-center rounded-full bg-cyan-500/20 text-xs font-bold text-cyan-300">2</div>
+                        <div>
+                          <h4 className="font-bold text-slate-200">Debits Breakdown (The Outgoing Transactions)</h4>
+                          <p className="text-xs text-slate-400 mt-1">Finally, the AI must list all outgoing transactions with their full description and amount so we can audit expenses without mixing them up with incoming funds.</p>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
 
         {/* ── Stats Row ── */}
         {hasResults && (
